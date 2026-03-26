@@ -48,6 +48,13 @@ mail_curl:
 # openai注册时代理地址，例子：http://127.0.0.1:7897。如果是国外服务器此项可以不填
 default_proxy: ""
 
+# 是否开启注册多线程并发 (true/false)
+enable_multi_thread_reg: false    
+# 注册时的最大并发线程数 (建议根据你的代理质量调整，不要设置过高)
+reg_threads: 10
+
+
+
 # Clash 节点智能轮换（本地使用clash软件）
 clash_proxy_pool:
   # 【开关】是否在每次注册前自动通过 Clash 切换节点
@@ -102,7 +109,7 @@ cpa_mode:
   enable: false
   # 【开关】开启 CPA 补货时，是否同时将账号 Token 备份到本地，默认true为备份
   save_to_local: true
-  # CPA的api地址
+  # CPA的访问地址
   api_url: "http://your-domain.com:8317"
   # CPA登陆密码
   api_token: "xxxx"
@@ -128,3 +135,5 @@ normal_mode:
   sleep_min: 5
   # 每次循环注册成功或失败后，最长等待时间 (秒)
   sleep_max: 30
+  # 单次(每批)执行的注册总数
+  target_count: 2

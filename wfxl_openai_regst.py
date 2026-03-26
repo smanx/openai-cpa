@@ -76,6 +76,9 @@ USE_PROXY_FOR_EMAIL = _c.get("use_proxy_for_email", False)
 ENABLE_EMAIL_MASKING = _c.get("enable_email_masking", True)
 TOKEN_OUTPUT_DIR = _c.get("token_output_dir", "").strip()
 
+ENABLE_MULTI_THREAD_REG = _c.get("enable_multi_thread_reg", False)
+REG_THREADS = _c.get("reg_threads", 3)
+
 _cpa = _c.get("cpa_mode", {})
 ENABLE_CPA_MODE = _cpa.get("enable", False)
 SAVE_TO_LOCAL_IN_CPA_MODE = _cpa.get("save_to_local", True)
@@ -92,6 +95,7 @@ CHECK_INTERVAL_MINUTES = _cpa.get("check_interval_minutes", 60)
 _normal = _c.get("normal_mode", {})
 NORMAL_SLEEP_MIN = _normal.get("sleep_min", 5)
 NORMAL_SLEEP_MAX = _normal.get("sleep_max", 30)
+NORMAL_TARGET_COUNT = _normal.get("target_count", 0)
 
 
 # --- 以下为内容不要改变 ---
@@ -420,7 +424,7 @@ def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_
     mailbox_id = jwt 
     mail_proxies = proxies if USE_PROXY_FOR_EMAIL else None
     base_url = GPTMAIL_BASE.rstrip('/')
-    print(f"[{ts()}] [INFO] 等待接收验证码 ({mask_email(email)}) ", end="", flush=True)
+    print(f"\n[{ts()}] [INFO] 等待接收验证码 ({mask_email(email)}) ", end="", flush=True)
 
     if processed_mail_ids is None:
         processed_mail_ids = set()
@@ -492,7 +496,7 @@ def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_
                                         processed_mail_ids.add(m_id)
                                         print(f"\n[{ts()}] [SUCCESS] 发现验证码: {code} (来自: {mail_item.get('sender_name')})")
                                         return code
-            if EMAIL_API_MODE == "cloudmail":
+            elif EMAIL_API_MODE == "cloudmail":
                 token = get_cm_token(mail_proxies)
                 if token:
                     url = f"{CM_API_URL}/api/public/emailList"
@@ -514,7 +518,7 @@ def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_
                                     processed_mail_ids.add(m_id)
                                     print(f"\n[{ts()}] [SUCCESS] CloudMail 提取验证码成功: {code}")
                                     return code
-            if EMAIL_API_MODE == "imap":
+            elif EMAIL_API_MODE == "imap":
                 if not mail_conn:
                     try:
                         mail_conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=15)
@@ -756,7 +760,6 @@ def _to_int(v: Any) -> int:
     except (TypeError, ValueError): return 0
 
 def _post_form(url: str, data: Dict[str, str], proxies: Any = None, timeout: int = 30, retries: int = 3) -> Dict[str, Any]:
-    """带有自动重试机制的表单提交 (用于对抗 TLS 闪断和代理掉线)"""
     last_error: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
@@ -986,12 +989,12 @@ class SentinelTokenGenerator:
         for ch in text:
             h ^= ord(ch)
             h = (h * 16777619) & 0xFFFFFFFF
-        h ^= (h >> 16)
-        h = (h * 2246822507) & 0xFFFFFFFF
-        h ^= (h >> 13)
-        h = (h * 3266489909) & 0xFFFFFFFF
-        h ^= (h >> 16)
-        return format(h & 0xFFFFFFFF, "08x")
+            h ^= (h >> 16)
+            h = (h * 2246822507) & 0xFFFFFFFF
+            h ^= (h >> 13)
+            h = (h * 3266489909) & 0xFFFFFFFF
+            h ^= (h >> 16)
+            return format(h & 0xFFFFFFFF, "08x")
 
     def _get_config(self):
         now_str = time.strftime("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)", time.gmtime())
@@ -1159,7 +1162,7 @@ def run(proxy: Optional[str]) -> tuple:
             print(f"[{ts()}] [ERROR] 账户创建受阻: 遭遇拦截，响应代码 {create_account_resp.status_code}")
             return None, None
 
-        print(f"[{ts()}] [INFO] 基础信息建立完毕，执行静默风控重登录...")
+        print(f"[{ts()}] [INFO] 基础信息建立完毕，执行静风控重登录...")
         s.cookies.clear()
         
         oauth = generate_oauth_url()
@@ -1620,6 +1623,49 @@ def process_account_worker(i: int, total: int, item: dict, args: Any) -> bool:
                     print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 已死亡，当前已是禁用状态，根据配置保留不删除。")
         return refresh_success
 
+def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
+    """统一处理注册返回结果，保存到本地并可选择上传CPA"""
+    if not result:
+        print(f"[{ts()}] [ERROR] 本次注册任务执行失败")
+        return "failed"
+        
+    token_json_str, password = result
+    if token_json_str == "retry_403":
+        print(f"[{ts()}] [WARNING] 检测到 403 频率限制，挂起重试...")
+        return "retry_403"
+        
+    if token_json_str:
+        token_data = json.loads(token_json_str)
+        account_email = token_data.get('email', 'unknown')
+        
+        # 保存本地
+        if (cpa_upload and SAVE_TO_LOCAL_IN_CPA_MODE) or not cpa_upload:
+            fname_email = account_email.replace("@", "_")
+            base_dir = TOKEN_OUTPUT_DIR or "."
+            if base_dir != ".": os.makedirs(base_dir, exist_ok=True)
+
+            json_file_name = f"token_{fname_email}_{int(time.time())}.json"
+            json_path = os.path.join(base_dir, json_file_name)
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write(token_json_str)
+            print(f"[{ts()}] [SUCCESS] 本地 JSON 备份成功: {json_file_name}")
+
+            if account_email and password:
+                accounts_file = os.path.join(base_dir, "accounts.txt")
+                with open(accounts_file, "a", encoding="utf-8") as af:
+                    af.write(f"{account_email}----{password}\n")
+                print(f"[{ts()}] [SUCCESS] 账号密码已追加至本地 accounts.txt")
+                
+        # CPA 上传
+        if cpa_upload:
+            success, up_msg = upload_to_cpa_integrated(token_data, CPA_API_URL, CPA_API_TOKEN)
+            if success:
+                print(f"[{ts()}] [SUCCESS] 补货凭证 {mask_email(account_email)} 云端上传成功！")
+            else:
+                print(f"[{ts()}] [ERROR] 云端上传失败: {up_msg}")
+                
+    return "success"
+
 
 async def cpa_main_loop(args):
     """CPA 智能仓管模式 (测活、清理、补货、上传一体化)"""
@@ -1653,49 +1699,32 @@ async def cpa_main_loop(args):
 
             if valid_count < MIN_ACCOUNTS_THRESHOLD:
                 print(f"[{ts()}] [INFO] 侦测到库存不足 (当前 {valid_count} < 阈值 {MIN_ACCOUNTS_THRESHOLD})，启动注册补货...")
-                for _ in range(BATCH_REG_COUNT):
-                    if not smart_switch_node():
-                        print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
-                    await asyncio.sleep(1)
-                    
-                    result = await loop.run_in_executor(None, run, args.proxy)
-                    if not result:
-                        continue
-                    
-                    token_json_str, password = result
-                    if token_json_str == "retry_403":
-                        print(f"[{ts()}] [WARNING] 检测到 403 频率限制，任务挂起 10 秒后重试...")
-                        await asyncio.sleep(10)
-                        continue
-                    
-                    if token_json_str:
-                        token_data = json.loads(token_json_str)
-                        account_email = token_data.get('email', 'unknown')
-                        if SAVE_TO_LOCAL_IN_CPA_MODE:
-                            fname_email = account_email.replace("@", "_")
-                            base_dir = TOKEN_OUTPUT_DIR or "."
-                            if base_dir != ".": os.makedirs(base_dir, exist_ok=True)
-
-                            json_file_name = f"token_{fname_email}_{int(time.time())}.json"
-                            json_path = os.path.join(base_dir, json_file_name)
-                            with open(json_path, "w", encoding="utf-8") as f:
-                                f.write(token_json_str)
-                            print(f"[{ts()}] [SUCCESS] 本地 JSON 备份成功: {json_file_name}")
-
-                            if account_email:
-                                accounts_file = os.path.join(base_dir, "accounts.txt")
-                                with open(accounts_file, "a", encoding="utf-8") as af:
-                                    af.write(f"{account_email}----{password}\n")
-                                print(f"[{ts()}] [SUCCESS] 账号密码已追加至本地 accounts.txt")
+                if not smart_switch_node():
+                    print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
+                await asyncio.sleep(1)
+                
+                if ENABLE_MULTI_THREAD_REG:
+                    print(f"[{ts()}] [INFO] 启动多线程并发补货... (并发线程数: {REG_THREADS}, 目标数: {BATCH_REG_COUNT})")
+                    with ThreadPoolExecutor(max_workers=REG_THREADS) as executor:
+                        reg_futures = [
+                            loop.run_in_executor(executor, run, args.proxy)
+                            for _ in range(BATCH_REG_COUNT)
+                        ]
+                        reg_results = await asyncio.gather(*reg_futures)
                         
-                        # CPA 上传
-                        success, up_msg = upload_to_cpa_integrated(token_data, CPA_API_URL, CPA_API_TOKEN)
-                        if success:
-                            print(f"[{ts()}] [SUCCESS] 补货凭证 {mask_email(account_email)} 云端上传成功！")
-                        else:
-                            print(f"[{ts()}] [ERROR] 云端上传失败: {up_msg}")
-                    
-                    await asyncio.sleep(5)
+                    for result in reg_results:
+                        status = handle_registration_result(result, cpa_upload=True)
+                        if status == "retry_403":
+                            await asyncio.sleep(10)
+                else:
+                    print(f"[{ts()}] [INFO] 启动单线程串行补货... (目标数: {BATCH_REG_COUNT})")
+                    for _ in range(BATCH_REG_COUNT):
+                        result = await loop.run_in_executor(None, run, args.proxy)
+                        status = handle_registration_result(result, cpa_upload=True)
+                        if status == "retry_403":
+                            await asyncio.sleep(10)
+                            continue
+                        await asyncio.sleep(5)
             else:
                 print(f"[{ts()}] [INFO] 仓库存量充足，无需补发。")
             
@@ -1710,58 +1739,68 @@ def normal_main_loop(args):
     """常规模式 (纯量产注册，存本地)"""
     sleep_min = max(1, NORMAL_SLEEP_MIN)
     sleep_max = max(sleep_min, NORMAL_SLEEP_MAX)
-    count = 0
+    target_count = NORMAL_TARGET_COUNT
+
+    print(f"\n[{ts()}] >>> 启动常规量产模式 <<<")
+    if target_count > 0:
+        print(f"[{ts()}] 任务目标: 注册 {target_count} 个账号后自动停止")
+    else:
+        print(f"[{ts()}] 任务目标: 无限挂机注册 (按 Ctrl+C 停止)")
+
+    success_count = 0
+    total_attempts = 0
 
     while True:
-        count += 1
-        print(f"\n[{ts()}] >>> 开始第 {count} 次量产注册任务 <<<")
+        if target_count > 0 and success_count >= target_count:
+            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
+            break
+
+        total_attempts += 1
+        print(f"\n[{ts()}] --- 开始发起第 {total_attempts} 次注册请求 (当前已成功: {success_count}) ---")
         
         if not smart_switch_node():
             print(f"[{ts()}] [WARNING] 节点切换失败，将使用当前 IP 继续尝试...")
         time.sleep(1)
+
         try:
-            result = run(args.proxy)
-            if not result:
-                print(f"[{ts()}] [ERROR] 本次注册任务执行失败")
+            if ENABLE_MULTI_THREAD_REG:
+                current_batch_size = REG_THREADS
+                if target_count > 0:
+                    current_batch_size = min(REG_THREADS, target_count - success_count)
+
+                print(f"[{ts()}] [INFO] 启用多线程并发... (并发分配: {current_batch_size})")
+                with ThreadPoolExecutor(max_workers=current_batch_size) as executor:
+                    futures = [executor.submit(run, args.proxy) for _ in range(current_batch_size)]
+                    for future in futures:
+                        result = future.result()
+                        status = handle_registration_result(result, cpa_upload=False)
+                        if status == "success":
+                            success_count += 1
+                        elif status == "retry_403":
+                            time.sleep(10)
+
             else:
-                token_json_str, password = result
-                if token_json_str == "retry_403":
-                    print(f"[{ts()}] [WARNING] 检测到 403 频率限制，任务挂起 10 秒后重试...")
+                print(f"[{ts()}] [INFO] 启用单线程注册...")
+                result = run(args.proxy)
+                status = handle_registration_result(result, cpa_upload=False)
+                if status == "success":
+                    success_count += 1
+                elif status == "retry_403":
                     time.sleep(10)
                     continue
 
-                if token_json_str:
-                    token_data = json.loads(token_json_str)
-                    account_email = token_data.get("email", "unknown")
-                    fname_email = account_email.replace("@", "_")
-
-                    base_dir = TOKEN_OUTPUT_DIR or "."
-                    if base_dir != ".": os.makedirs(base_dir, exist_ok=True)
-                    
-                    file_name = os.path.join(base_dir, f"token_{fname_email}_{int(time.time())}.json")
-                    with open(file_name, "w", encoding="utf-8") as f:
-                        f.write(token_json_str)
-
-                    masked_fname = mask_email(account_email).replace("@", "_")
-                    masked_file_name = os.path.join(base_dir, f"token_{masked_fname}_{int(time.time())}.json")
-                    print(f"[{ts()}] [SUCCESS] Token 凭证已生成: {masked_file_name}")
-
-                    if account_email and password:
-                        accounts_file = os.path.join(base_dir, "accounts.txt")
-                        with open(accounts_file, "a", encoding="utf-8") as af:
-                            af.write(f"{account_email}----{password}\n")
-                        print(f"[{ts()}] [SUCCESS] 账户明文信息已归档: {accounts_file}")
-                else:
-                    print(f"[{ts()}] [ERROR] 本次注册任务执行失败")
-
         except Exception as e:
             print(f"[{ts()}] [ERROR] 发生未捕获全局异常: {e}")
+
+        if target_count > 0 and success_count >= target_count:
+            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
+            break
 
         if args.once:
             break
 
         wait_time = random.randint(sleep_min, sleep_max)
-        print(f"[{ts()}] [INFO] 任务进入休眠，等待 {wait_time} 秒后继续...")
+        print(f"[{ts()}] [INFO] 缓冲防风控，等待 {wait_time} 秒后继续...")
         time.sleep(wait_time)
 
 def main() -> None:
@@ -1775,12 +1814,13 @@ def main() -> None:
     print("=" * 65)
     print("   OpenAI 无限注册 & CPA 智能仓管")
     print("   Author: (wenfxl)轩灵")
-    print("   特性1: 支持纯协议无限注册、周限额低于设定值自动从CPA剔除")
-    print("   特性2: CPA里凭证失效后测活时自动复活、低于存货数自动补货")
+    print("   特性1: 支持纯协议无限注册、周限额低于设定值自动挂起/剔除")
+    print("   特性2: CPA里凭证失效后自动抢救，周限额恢复后自动唤醒")
+    print("   特性3: 全局支持测活、注册双重多线程控制")
     print("-" * 65)
     if ENABLE_CPA_MODE:
         print("   当前状态: [ CPA 智能仓管模式 ] 已开启")
-        print("   行为逻辑: 自动巡检测活 -> 智能复活/剔除死号 -> 补货注册 -> 云端上传")
+        print("   行为逻辑: 自动巡检测活 -> 智能挂起/剔除死号 -> 补货注册 -> 云端上传")
     else:
         print("   当前状态: [ 常规量产模式 ] 已开启")
         print("   行为逻辑: 纯净无限注册 -> 本地保存 (CPA 上传已关闭)")

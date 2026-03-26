@@ -470,7 +470,7 @@ clash_proxy_pool:
 ### 5. Start Mihomo in the background
 
 ```bash
-nohup ./mihomo -d /opt/clash > clash.log 2>&1 &
+nohup /opt/clash/mihomo -d /opt/clash > /opt/clash/clash.log 2>&1 &
 ```
 
 This starts Mihomo in the background and writes logs to `clash.log`.
