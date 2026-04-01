@@ -3,13 +3,18 @@
 # https://github.com/dreamhunter2333/cloudflare_temp_email
 # https://github.com/maillab/cloud-mail
 # https://github.com/s12ryt/mail-curl
-# 可选值: "imap" / "freemail" / "cloudflare_temp_email" / "cloudmail" / "mail_curl"
+# 可选值: "imap" / "freemail" / "cloudflare_temp_email" / "cloudmail" / "mail_curl" / "luckmail"
 email_api_mode: "cloudflare_temp_email"
 
 # [基础配置: cloudflare_temp_email / imap / cloudmail 共享]
 # 你的域名 (支持逗号分隔多域名随机轮换) 如果只有一个域名就只填一个域名
 
 mail_domains: "domain1.com,domain2.xyz,domain3.net"
+
+#二级域名开关
+enable_sub_domains: false
+
+sub_domain_count: 1
 # 你的临时邮箱 后端API 基础地址 结尾不要/，IMAP和freemail/cloudmail/mail_curl不需要配置此项。注意：用浏览器打开后端api验证是否可访问
 gptmail_base: "https://your-domain.com" #是后端访问链接，不是前端访问链接，正常情况浏览器打开访问会显示ok就是对的
 
@@ -34,6 +39,8 @@ freemail:
   api_url: "https://your-domain.com"
   #JWTTOKEN
   api_token: ""
+  admin_username: 
+  admin_password: 
 
 # [模式 "cloud-mail" 专属配置]
 cloudmail:
@@ -48,6 +55,10 @@ mail_curl:
   #访问链接
   api_base: "https://your-domain.com"
   key: "" # 你的密钥
+
+luckmail:
+  api_key: ""
+  preferred_domain: ""
 
 # [代理配置]
 # openai注册时代理地址，例子：http://127.0.0.1:7897。如果是国外服务器此项可以不填
@@ -124,10 +135,6 @@ enable_email_masking: true
 login_delay_min: 20
 login_delay_max: 45
 
-# [Token 存放目录]
-# 默认存放跟脚本一个目录
-token_output_dir: ""
-
 # CPA 模式专属配置
 cpa_mode:
   # 【开关】true 开启巡检补货上传，false 则只进行常规无限注册
@@ -156,6 +163,21 @@ cpa_mode:
   #并发线程数配置，默认 10 线程
   threads: 10
 
+# SUB2APIA配置 参数含义跟CPA相同
+sub2api_mode:
+  enable: false
+  save_to_local: true
+  api_url: 
+  api_key: 
+  min_accounts_threshold: 20
+  batch_reg_count: 1
+  min_remaining_weekly_percent: 80
+  remove_on_limit_reached: true
+  remove_dead_accounts: true
+  enable_token_revive: false
+  check_interval_minutes: 60
+  threads: 10
+
 # 常规量产模式专属配置
 normal_mode:
   # 每次循环注册成功或失败后，最短等待时间 (秒)
@@ -164,3 +186,13 @@ normal_mode:
   sleep_max: 30
   # 单次(每批)执行的注册总数
   target_count: 2
+# WEB端密码
+web_password: admin
+# 二级域名列表
+sub_domains_list: ''
+#CF账号
+cf_api_email: 
+#CF KEY
+cf_api_key: 
+sub_domain_fail_threshold: 1
+sub_domain_refill_count: 2

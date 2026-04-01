@@ -1,1954 +1,693 @@
-import json
+import asyncio
 import os
-import re
+import yaml
+import uvicorn
+import secrets
+import glob
+import json
 import time
 import random
 import string
-import secrets
-import hashlib
-import base64
-import argparse
-import asyncio
-import uuid
-import yaml
-import subprocess
-import builtins
-import threading
-import io
-from proxy_manager import smart_switch_node
-from datetime import datetime
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+import urllib.request
 import urllib.parse
-from urllib.parse import urlparse, parse_qs, quote
-from html import unescape
-from concurrent.futures import ThreadPoolExecutor
-import queue
-import imaplib
-import socks
-import socket
-from email import message_from_string
-from email.header import decode_header, make_header
-from email.message import Message
-from email.policy import default as email_policy
-import email as email_lib
+from collections import deque
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
+from cloudflare import Cloudflare
 
-from curl_cffi import requests
-from curl_cffi import CurlMime
+from utils import core_engine
+from utils.config import reload_all_configs
+from utils import db_manager
+from utils.sub2api_client import Sub2APIClient
+app = FastAPI(title="Wenfxl Codex Manager")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ================= 配置加载 =================
-def init_config():
-    config_path = "config.yaml"
-    if not os.path.exists(config_path):
-        print(f"[{ts()}] [ERROR] 配置文件 {config_path} 不存在，请检查！")
-        exit(1)
-    
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-_c = init_config()
+engine = core_engine.RegEngine()
+db_manager.init_db()
+log_history = deque(maxlen=500)
+VALID_TOKENS = set()
 
-EMAIL_API_MODE = _c.get("email_api_mode", "cloudflare_temp_email")
-MAIL_DOMAINS = _c.get("mail_domains", "")
-GPTMAIL_BASE = _c.get("gptmail_base", "")
-
-_imap = _c.get("imap", {})
-IMAP_SERVER = _imap.get("server", "imap.gmail.com")
-IMAP_PORT = _imap.get("port", 993)
-IMAP_USER = _imap.get("user", "")
-IMAP_PASS = _imap.get("pass", "")
-
-_free = _c.get("freemail", {})
-FREEMAIL_API_URL = _free.get("api_url", "")
-FREEMAIL_API_TOKEN = _free.get("api_token", "")
-
-_cm = _c.get("cloudmail", {})
-CM_API_URL = _cm.get("api_url", "").rstrip('/')
-CM_ADMIN_EMAIL = _cm.get("admin_email", "")
-CM_ADMIN_PASS = _cm.get("admin_password", "")
-_CM_TOKEN_CACHE = None
-
-_mc = _c.get("mail_curl", {})
-MC_API_BASE = _mc.get("api_base", "").rstrip('/')
-MC_KEY = _mc.get("key", "")
-
-ADMIN_AUTH = _c.get("admin_auth", "")
-
-MAX_OTP_RETRIES = _c.get("max_otp_retries", 5)
-DEFAULT_PROXY = _c.get("default_proxy", "")
-USE_PROXY_FOR_EMAIL = _c.get("use_proxy_for_email", False)
-ENABLE_EMAIL_MASKING = _c.get("enable_email_masking", True)
-TOKEN_OUTPUT_DIR = _c.get("token_output_dir", "").strip()
-
-LOGIN_DELAY_MIN = _c.get("login_delay_min", 20)
-LOGIN_DELAY_MAX = _c.get("login_delay_max", 45)
-
-ENABLE_EMAIL_MASKING = _c.get("enable_email_masking", True)
-
-ENABLE_MULTI_THREAD_REG = _c.get("enable_multi_thread_reg", False)
-REG_THREADS = _c.get("reg_threads", 3)
-
-_cpa = _c.get("cpa_mode", {})
-ENABLE_CPA_MODE = _cpa.get("enable", False)
-SAVE_TO_LOCAL_IN_CPA_MODE = _cpa.get("save_to_local", True)
-CPA_API_URL = _cpa.get("api_url", "")
-CPA_API_TOKEN = _cpa.get("api_token", "")
-MIN_ACCOUNTS_THRESHOLD = _cpa.get("min_accounts_threshold", 30)
-BATCH_REG_COUNT = _cpa.get("batch_reg_count", 1)
-MIN_REMAINING_WEEKLY_PERCENT = _cpa.get("min_remaining_weekly_percent", 80)
-REMOVE_ON_LIMIT_REACHED = _cpa.get("remove_on_limit_reached", False)
-REMOVE_DEAD_ACCOUNTS = _cpa.get("remove_dead_accounts", False)
-CPA_THREADS = _cpa.get("threads", 10)
-CHECK_INTERVAL_MINUTES = _cpa.get("check_interval_minutes", 60)
-ENABLE_TOKEN_REVIVE = _cpa.get("enable_token_revive", False)
-
-_normal = _c.get("normal_mode", {})
-NORMAL_SLEEP_MIN = _normal.get("sleep_min", 5)
-NORMAL_SLEEP_MAX = _normal.get("sleep_max", 30)
-NORMAL_TARGET_COUNT = _normal.get("target_count", 0)
-
-WARP_PROXY_LIST = _c.get("warp_proxy_list", [])
-_clash_conf = _c.get("clash_proxy_pool", {})
-_clash_enable = _clash_conf.get("enable", False)
-_clash_pool_mode = _clash_conf.get("pool_mode", False)
-if not _clash_enable:
-    WARP_PROXY_LIST = []
-elif not _clash_pool_mode:
-    WARP_PROXY_LIST = []
-PROXY_QUEUE = queue.Queue()
-
-if _clash_enable and _clash_pool_mode:
-    for p in WARP_PROXY_LIST:
-        PROXY_QUEUE.put(p)
-else:
-    PROXY_QUEUE.put(DEFAULT_PROXY or None)
-
-# --- 以下为内容不要改变 ---
-AUTH_URL = "https://auth.openai.com/oauth/authorize"
-TOKEN_URL = "https://auth.openai.com/oauth/token"
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_REDIRECT_URI = "http://localhost:1455/auth/callback"
-DEFAULT_SCOPE = "openid email profile offline_access"
-DEFAULT_CLIPROXY_UA = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-KNOWN_CLIPROXY_ERROR_LABELS = {
-    "usage_limit_reached": "周限额已耗尽",
-    "account_deactivated": "账号已停用",
-    "insufficient_quota": "额度不足",
-    "invalid_api_key": "凭证无效",
-    "unsupported_region": "地区不支持",
-}
-OTP_CODE_PATTERN = r"(?<!\d)(\d{6})(?!\d)"
-# ================= 配置加载结束 =================
-
-def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path): return
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line: continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                if not key or key in os.environ: continue
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-                    value = value[1:-1]
-                os.environ[key] = value
-    except Exception: pass
-
-_load_dotenv()
-
-_original_print = builtins.print
-_thread_local = threading.local()
-_print_lock = threading.Lock()
-
-def thread_safe_print(*args, **kwargs):
-    """
-    智能拦截器：
-    单线程下：原样输出，保留进度条打点效果。
-    多线程下：把同一个线程里的 `end=""` 缓存起来，直到遇到换行符才一次性加锁输出。
-    """
-    if not globals().get("ENABLE_MULTI_THREAD_REG", False):
-        with _print_lock:
-            _original_print(*args, **kwargs)
-        return
-    if not hasattr(_thread_local, 'buffer'):
-        _thread_local.buffer = ""
-
-    temp_io = io.StringIO()
-    _original_print(*args, file=temp_io, **kwargs)
-
-    _thread_local.buffer += temp_io.getvalue()
-
-    if _thread_local.buffer.endswith('\n'):
-        with _print_lock:
-            final_msg = _thread_local.buffer.lstrip('\n')
-            if final_msg:
-                _original_print(final_msg, end="", flush=True)
-        _thread_local.buffer = ""
-
-builtins.print = thread_safe_print
-
-
-def ts() -> str:
-    """获取当前时间戳字符串"""
-    return datetime.now().strftime("%H:%M:%S")
-    
-def mask_email(text: str) -> str:
-    """隐藏邮箱 @ 后面的域名，用于日志脱敏 (兼容标准邮箱和本地 Token 文件名)"""
-    if not ENABLE_EMAIL_MASKING or not text:
-        return text
-
-    if "@" in text:
-        prefix, domain = text.split("@", 1)
-        return f"{prefix}@***.***"
-
-    match = re.match(r"token_(.+)_(\d{10,})\.json", text)
-    if match:
-        email_part = match.group(1)
-        timestamp = match.group(2)
-
-        mid = len(email_part) // 2
-        masked_email = email_part[:mid] + "***"
-        return f"token_{masked_email}_{timestamp}.json"
+class DummyArgs:
+    def __init__(self, proxy=None, once=False):
+        self.proxy = proxy
+        self.once = once
         
-    if len(text) > 8 and ".json" in text:
-        name_part = text.replace(".json", "")
-        mid = len(name_part) // 2
-        return f"{name_part[:mid]}***.json"
+class ExportReq(BaseModel):
+    emails: list[str]
 
-    return text
+class DeleteReq(BaseModel):
+    emails: list[str]
+
+class LoginData(BaseModel):
+    password: str
+
+class GenerateSubReq(BaseModel):
+    main_domains: str
+    count: int
+    api_email: str
+    api_key: str
+    sync: bool
     
-def _ssl_verify() -> bool:
-    flag = os.getenv("OPENAI_SSL_VERIFY", "1").strip().lower()
-    return flag not in {"0", "false", "no", "off"}
+class CFSyncExistingReq(BaseModel):
+    sub_domains: str
+    api_email: str
+    api_key: str
 
-def _skip_net_check() -> bool:
-    flag = os.getenv("SKIP_NET_CHECK", "0").strip().lower()
-    return flag in {"1", "true", "yes", "on"}
+class CFDeleteExistingReq(BaseModel):
+    sub_domains: str
+    api_email: str
+    api_key: str
+    
+class CFQueryReq(BaseModel):
+    main_domains: str
+    api_email: str
+    api_key: str
 
-def get_mc_email(proxies=None):
-    """请求 mail-curl 接口创建/刷新邮箱"""
+def get_web_password():
     try:
-        url = f"{MC_API_BASE}/api/remail?key={MC_KEY}"
-        res = requests.post(url, proxies=proxies, verify=_ssl_verify(), timeout=15)
-        data = res.json()
-        if data.get("email"):
-            return data["email"], data["id"]
-    except Exception as e:
-        print(f"[{ts()}] [ERROR] mail-curl 获取邮箱失败: {e}")
-    return None, None
-
-def get_cm_token(proxies=None):
-    """用于生成 CloudMail 确认身份的令牌"""
-    global _CM_TOKEN_CACHE
-    if _CM_TOKEN_CACHE:
-        return _CM_TOKEN_CACHE
-    
-    try:
-        url = f"{CM_API_URL}/api/public/genToken"
-        payload = {"email": CM_ADMIN_EMAIL, "password": CM_ADMIN_PASS}
-        res = requests.post(url, json=payload, proxies=proxies, verify=_ssl_verify(), timeout=15)
-        data = res.json()
-        if data.get("code") == 200:
-            _CM_TOKEN_CACHE = data["data"]["token"]
-            return _CM_TOKEN_CACHE
-        else:
-            print(f"[{ts()}] [ERROR] CloudMail Token 生成失败: {data.get('message')}")
-    except Exception as e:
-        print(f"[{ts()}] [ERROR] CloudMail 接口请求异常: {e}")
-    return None
-
-def get_email_and_token(proxies: Any = None) -> tuple:
-    """兼容三模式的邮箱获取逻辑 (支持多域名随机轮换)"""
-    mail_proxies = proxies if USE_PROXY_FOR_EMAIL else None
-    letters = ''.join(random.choices(string.ascii_lowercase, k=5))
-    digits = ''.join(random.choices(string.digits, k=random.randint(1, 3)))
-    suffix = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
-    prefix = letters + digits + suffix
-    
-    if EMAIL_API_MODE == "mail_curl":
-        try:
-            url = f"{MC_API_BASE}/api/remail?key={MC_KEY}"
-            res = requests.post(url, proxies=mail_proxies, verify=_ssl_verify(), timeout=15)
-            data = res.json()
-            if data.get("email") and data.get("id"):
-                email = data["email"]
-                mailbox_id = data["id"]
-                print(f"[{ts()}] [INFO] mail-curl 分配邮箱: {email} (BoxID: {mailbox_id})")
-                return email, mailbox_id
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] mail-curl 获取邮箱异常: {e}")
-        return None, None
-    
-    if EMAIL_API_MODE == "cloudmail":
-        token = get_cm_token(mail_proxies)
-        if not token: 
-            print(f"[{ts()}] [ERROR] 未能获取 CloudMail Token，跳过注册")
-            return None, None
-        
-        domain_list = [d.strip() for d in MAIL_DOMAINS.split(",") if d.strip()]
-        if not domain_list:
-            print(f"[{ts()}] [ERROR] MAIL_DOMAINS 未配置")
-            return None, None
-            
-        selected_domain = random.choice(domain_list)
-        email_str = f"{prefix}@{selected_domain}"
-        
-        try:
-            url = f"{CM_API_URL}/api/public/addUser"
-            headers = {"Authorization": token}
-            body = {"list": [{"email": email_str}]}
-            res = requests.post(url, headers=headers, json=body, proxies=mail_proxies, timeout=15)
-            
-            if res.json().get("code") == 200:
-                print(f"[{ts()}] [INFO] CloudMail 成功创建用户: {email_str}")
-                return email_str, ""
-            else:
-                print(f"[{ts()}] [ERROR] CloudMail 创建用户失败: {res.text}")
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] CloudMail 添加用户异常: {e}")
-        return None, None
-        
-    if EMAIL_API_MODE == "freemail":
-        headers = {"Authorization": f"Bearer {FREEMAIL_API_TOKEN}", "Content-Type": "application/json"}
-        api_params = {}
-
-        try:
-            domain_res = requests.get(
-                f"{FREEMAIL_API_URL.rstrip('/')}/api/domains",
-                headers=headers, 
-                proxies=mail_proxies, 
-                verify=_ssl_verify(), 
-                timeout=15
-            )
-            raw_text = domain_res.text.strip()
-            
-            if raw_text.upper() == "OK" or not raw_text.startswith("["):
-                api_params["domainIndex"] = 0
-            else:
-                domains_list = domain_res.json()
-                if isinstance(domains_list, list) and len(domains_list) > 0:
-                    random_domain_index = random.randint(0, len(domains_list) - 1)
-                    api_params["domainIndex"] = random_domain_index
-        except Exception as e:
-            print(f"[{ts()}] [WARNING] 探测 Freemail 域名列表时出现小插曲: {e}。将直接使用默认参数生成。")
-            
-        for attempt in range(5):
-            try:
-                res = requests.get(
-                    f"{FREEMAIL_API_URL.rstrip('/')}/api/generate",
-                    params=api_params,
-                    headers=headers, proxies=mail_proxies, verify=_ssl_verify(), timeout=15
-                )
-                res.raise_for_status()
-                data = res.json()
-                if data and data.get("email"):
-                    email = data["email"].strip()
-                    print(f"[{ts()}] [INFO] 成功通过 Freemail 生成临时邮箱: {email}")
-                    return email, ""
-                else:
-                    print(f"[{ts()}] [WARNING] Freemail 邮箱生成失败 (尝试 {attempt + 1}/5): {res.text}")
-                    time.sleep(1)
-            except Exception as e:
-                print(f"[{ts()}] [ERROR] Freemail 邮箱注册异常，准备重试: {e}")
-                time.sleep(2)
-        return None, None
-
-    domain_list = [d.strip() for d in MAIL_DOMAINS.split(",") if d.strip()]
-    if not domain_list:
-        print(f"[{ts()}] [ERROR] MAIL_DOMAINS 配置为空，无法生成邮箱！")
-        return None, None
-        
-    selected_domain = random.choice(domain_list)
-    email_str = f"{prefix}@{selected_domain}"
-    
-    if EMAIL_API_MODE in ["imap"]:
-        print(f"[{ts()}] [INFO] 成功生成临时域名邮箱: {email_str}")
-        return email_str, ""
-
-    headers = {"x-admin-auth": ADMIN_AUTH, "Content-Type": "application/json"}
-    body = {"enablePrefix": False, "name": prefix, "domain": selected_domain}
-    
-    for attempt in range(5):
-        try:
-            res = requests.post(
-                f"{GPTMAIL_BASE}/admin/new_address", headers=headers, json=body,
-                proxies=mail_proxies, verify=_ssl_verify(), timeout=15
-            )
-            res.raise_for_status()
-            data = res.json()
-            if data and data.get("address"):
-                email = data["address"].strip()
-                jwt = data.get("jwt", "").strip()
-                print(f"[{ts()}] [INFO] 成功获取临时邮箱: {email}")
-                return email, jwt
-            else:
-                print(f"[{ts()}] [WARNING] 邮箱申请失败 (尝试 {attempt + 1}/5): {res.text}")
-                time.sleep(1)
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] 邮箱注册网络异常，准备重试: {e}")
-            time.sleep(2)
-            
-    return None, None
-
-def _decode_mime_header(value: str) -> str:
-    if not value: return ""
-    try: return str(make_header(decode_header(value)))
-    except Exception: return value
-
-def _extract_body_from_message(message: Message) -> str:
-    parts = []
-    if message.is_multipart():
-        for part in message.walk():
-            if part.get_content_maintype() == "multipart": continue
-            content_type = (part.get_content_type() or "").lower()
-            if content_type not in ("text/plain", "text/html"): continue
-            try:
-                payload = part.get_payload(decode=True)
-                charset = part.get_content_charset() or "utf-8"
-                text = payload.decode(charset, errors="replace") if payload else ""
-            except Exception:
-                try: text = part.get_content()
-                except Exception: text = ""
-            if content_type == "text/html": text = re.sub(r"<[^>]+>", " ", text)
-            parts.append(text)
-    else:
-        try:
-            payload = message.get_payload(decode=True)
-            charset = message.get_content_charset() or "utf-8"
-            body = payload.decode(charset, errors="replace") if payload else ""
-        except Exception:
-            try: body = message.get_content()
-            except Exception: body = str(message.get_payload() or "")
-        if "html" in (message.get_content_type() or "").lower():
-            body = re.sub(r"<[^>]+>", " ", body)
-        parts.append(body)
-    return unescape("\n".join(part for part in parts if part).strip())
-
-def _extract_mail_fields(mail: dict) -> dict:
-    sender = str(mail.get("source") or mail.get("from") or mail.get("from_address") or mail.get("fromAddress") or "").strip()
-    subject = str(mail.get("subject") or mail.get("title") or "").strip()
-    body_text = str(mail.get("text") or mail.get("body") or mail.get("content") or mail.get("html") or "").strip()
-    raw = str(mail.get("raw") or "").strip()
-    if raw:
-        try:
-            message = message_from_string(raw, policy=email_policy)
-            sender = sender or _decode_mime_header(message.get("From", ""))
-            subject = subject or _decode_mime_header(message.get("Subject", ""))
-            parsed_body = _extract_body_from_message(message)
-            if parsed_body: body_text = f"{body_text}\n{parsed_body}".strip() if body_text else parsed_body
-        except Exception:
-            body_text = f"{body_text}\n{raw}".strip() if body_text else raw
-
-    body_text = unescape(re.sub(r"<[^>]+>", " ", body_text))
-    return {"sender": sender, "subject": subject, "body": body_text, "raw": raw}
-
-
-def _extract_otp_code(content: str) -> str:
-    """提取验证码的增强正则"""
-    if not content: return ""
-    patterns = [
-        r"(?i)Your ChatGPT code is\s*(\d{6})",
-        r"(?i)ChatGPT code is\s*(\d{6})",
-        r"(?i)verification code to continue:\s*(\d{6})",
-        r"(?i)Subject:.*?(\d{6})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, content)
-        if match:
-            return match.group(1)
-    fallback = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
-    return fallback.group(1) if fallback else ""
-
-class ProxiedIMAP4_SSL(imaplib.IMAP4_SSL):
-    def __init__(self, host, port, proxy_host, proxy_port, proxy_type, **kwargs):
-        self.proxy_host = proxy_host
-        self.proxy_port = proxy_port
-        self.proxy_type = proxy_type
-        self.timeout_val = kwargs.pop('timeout', 60)
-        super().__init__(host, port, **kwargs)
-
-    def _create_socket(self, timeout):
-        sock = socks.socksocket()
-        sock.set_proxy(self.proxy_type, self.proxy_host, self.proxy_port)
-        sock.settimeout(self.timeout_val)
-        sock.connect((self.host, self.port))
-        return sock
-
-def get_oai_code(email: str, jwt: str = "", proxies: Any = None, processed_mail_ids: set = None, pattern: str = OTP_CODE_PATTERN) -> str:
-    """基于 Mail ID 过滤的验证码提取 (支持 JWT 或 Admin 双重鉴权)"""
-    mailbox_id = jwt 
-    mail_proxies = proxies if USE_PROXY_FOR_EMAIL else None
-    base_url = GPTMAIL_BASE.rstrip('/')
-    print(f"\n[{ts()}] [INFO] 等待接收验证码 ({mask_email(email)}) ", end="", flush=True)
-
-    if processed_mail_ids is None:
-        processed_mail_ids = set()
-    def create_imap_conn():
-        if USE_PROXY_FOR_EMAIL and DEFAULT_PROXY and IMAP_SERVER.lower() == "imap.gmail.com":
-            try:
-                import socks
-                import socket
-            except ImportError:
-                print(f"\n[{ts()}] [WARNING] 未安装 pysocks，回退到直连。")
-                return imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=60)
-            
-            print(f"\n[{ts()}] [INFO] 正在为 IMAP 注入底层代理穿透...")
-            try:
-                parsed = urlparse(DEFAULT_PROXY)
-                proxy_host = parsed.hostname
-                proxy_port = parsed.port or 80
-                proxy_type = socks.HTTP if parsed.scheme.lower() in ['http', 'https'] else socks.SOCKS5
-                
-                original_socket = socket.socket
-                
-                try:
-                    socks.set_default_proxy(proxy_type, proxy_host, proxy_port)
-                    socket.socket = socks.socksocket
-                    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=20)
-                    return conn
-                finally:
-                    socket.socket = original_socket
-                    
-            except Exception as e:
-                print(f"\n[{ts()}] [ERROR] IMAP 代理注入失败: {e}，尝试回退到直连。")
-                return imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=15)
-        else:
-            return imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=15)
-    mail_conn = None
-    if EMAIL_API_MODE == "imap":
-        try:
-            mail_conn = create_imap_conn()
-            clean_pass = IMAP_PASS.replace(" ", "")
-            mail_conn.login(IMAP_USER, clean_pass)
-        except Exception as e:
-            print(f"\n[{ts()}] [ERROR] IMAP 初始登录失败: {e}")
-            mail_conn = None
-    start_time = time.time()
-    for attempt in range(20):
-        try:
-            if EMAIL_API_MODE == "mail_curl":
-                inbox_url = f"{MC_API_BASE}/api/inbox?key={MC_KEY}&mailbox_id={mailbox_id}"
-                res = requests.get(inbox_url, proxies=mail_proxies, verify=_ssl_verify(), timeout=10)
-                
-                if res.status_code == 200:
-                    mail_list = res.json()
-                    
-                    if isinstance(mail_list, list) and len(mail_list) > 0:
-                        for mail_item in mail_list:
-                            m_id = mail_item.get("mail_id")
-                            s_name = mail_item.get("sender_name", "").lower()
-                            
-                            if m_id and m_id not in processed_mail_ids and "openai" in s_name:
-                                detail_url = f"{MC_API_BASE}/api/mail?key={MC_KEY}&id={m_id}"
-                                detail_res = requests.get(detail_url, proxies=mail_proxies, verify=_ssl_verify(), timeout=10)
-                                
-                                if detail_res.status_code == 200:
-                                    detail = detail_res.json()
-                                    body = f"{detail.get('subject','')}\n{detail.get('content','')}\n{detail.get('html','')}"
-                                    
-                                    code = _extract_otp_code(body)
-                                    if code:
-                                        processed_mail_ids.add(m_id)
-                                        print(f"\n[{ts()}] [SUCCESS] 发现验证码: {code} (来自: {mail_item.get('sender_name')})")
-                                        return code
-            elif EMAIL_API_MODE == "cloudmail":
-                token = get_cm_token(mail_proxies)
-                if token:
-                    url = f"{CM_API_URL}/api/public/emailList"
-                    payload = {"toEmail": email, "timeSort": "desc", "size": 10}
-                    res = requests.post(url, headers={"Authorization": token}, json=payload, 
-                                        proxies=mail_proxies, timeout=15)
-                    
-                    if res.status_code == 200:
-                        mails = res.json().get("data", [])
-                        for m in mails:
-                            m_id = str(m.get("emailId"))
-                            if m_id in processed_mail_ids: continue
-                            
-                            content = f"{m.get('subject', '')}\n{m.get('text', '')}"
-                            
-                            if "openai" in m.get("sendEmail", "").lower() or "openai" in content.lower():
-                                code = _extract_otp_code(content)
-                                if code:
-                                    processed_mail_ids.add(m_id)
-                                    print(f"\n[{ts()}] [SUCCESS] CloudMail 提取验证码成功: {code}")
-                                    return code
-            elif EMAIL_API_MODE == "imap":
-                if not mail_conn:
-                    try:
-                        mail_conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=15)
-                        mail_conn.login(IMAP_USER, IMAP_PASS.replace(" ", ""))
-                    except Exception as e:
-                        time.sleep(5)
-                        continue
-
-                folders_to_check = ['INBOX', 'Junk', '"Junk Email"', 'Spam', '"[Gmail]/Spam"', '"垃圾邮件"']
-                found_in_loop = False
-                
-                for folder in folders_to_check:
-                    try:
-                        mail_conn.noop()
-                        status, _ = mail_conn.select(folder, readonly=True)
-                        if status != 'OK': continue
-                        
-                        search_query = f'(UNSEEN FROM "openai.com" TO "{email}")'
-                        status, messages = mail_conn.search(None, search_query)
-                        
-                        if status == 'OK' and messages[0]:
-                            mail_ids = messages[0].split()
-                            
-                            for mail_id in reversed(mail_ids):
-                                if mail_id in processed_mail_ids:
-                                    continue
-                                
-                                res, data = mail_conn.fetch(mail_id, '(RFC822)')
-                                for response_part in data:
-                                    if isinstance(response_part, tuple):
-                                        msg = email_lib.message_from_bytes(response_part[1])
-                                        
-                                        subject = str(msg.get("Subject", ""))
-                                        if "=?UTF-8?" in subject:
-                                            from email.header import decode_header
-                                            dh = decode_header(subject)
-                                            subject = "".join([str(t[0].decode(t[1] or 'utf-8') if isinstance(t[0], bytes) else t[0]) for t in dh])
-
-                                        content = ""
-                                        if msg.is_multipart():
-                                            for part in msg.walk():
-                                                if part.get_content_type() == "text/plain":
-                                                    try: content += part.get_payload(decode=True).decode('utf-8', 'ignore')
-                                                    except: pass
-                                        else:
-                                            content = msg.get_payload(decode=True).decode('utf-8', 'ignore')
-
-                                        to_header = str(msg.get("To", "")).lower()
-                                        delivered_to = str(msg.get("Delivered-To", "")).lower()
-                                        target_email = email.lower()
-                                        
-                                        if target_email not in to_header and target_email not in delivered_to and target_email not in content.lower():
-                                            processed_mail_ids.add(mail_id) 
-                                            continue 
-                                        
-                                        code = _extract_otp_code(f"{subject}\n{content}")
-                                        if code:
-                                            processed_mail_ids.add(mail_id)
-                                            print(f"\n[{ts()}] [SUCCESS] 验证码: {code}")
-                                            try:
-                                                mail_conn.logout()
-                                            except Exception:
-                                                pass
-                                            return code
-                                        else:
-                                            processed_mail_ids.add(mail_id)
-                            
-                            found_in_loop = True
-                            break
-                    except imaplib.IMAP4.abort as e:
-                        print(f"\n[{ts()}] [WARNING] IMAP 连接断开，将在下次循环重连...")
-                        mail_conn = None
-                        break
-                    except Exception as e:
-                        if "Spam" in folder:
-                            print(f"\n[{ts()}] [DEBUG] 访问垃圾箱失败: {e}")
-                
-                if not found_in_loop:
-                    print(".", end="", flush=True)
-            elif EMAIL_API_MODE == "freemail":
-                headers = {"Authorization": f"Bearer {FREEMAIL_API_TOKEN}", "Content-Type": "application/json"}
-                res = requests.get(
-                    f"{FREEMAIL_API_URL.rstrip('/')}/api/emails",
-                    params={"mailbox": email, "limit": 20},
-                    headers=headers,
-                    proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                )
-
-                if res.status_code == 200:
-                    raw_data = res.json()
-                    
-                    if isinstance(raw_data, dict):
-                        emails_list = raw_data.get("data") or raw_data.get("emails") or raw_data.get("messages") or raw_data.get("results") or []
-                    else:
-                        emails_list = raw_data
-                        
-                    if not isinstance(emails_list, list):
-                        emails_list = []
-
-                    for mail in emails_list:
-                        mail_id = str(mail.get("id") or mail.get("timestamp") or mail.get("subject") or "")
-                        if not mail_id or mail_id in processed_mail_ids:
-                            continue
-                        
-                        subject_text = str(mail.get("subject") or mail.get("title") or "")
-                        code = ""
-                        
-                        code_match = re.search(r'(?<!\d)(\d{6})(?!\d)', subject_text)
-                        if code_match:
-                            code = code_match.group(1)
-                        
-                        if not code:
-                            code = str(mail.get("code") or mail.get("verification_code") or "")
-                        
-                        if not code:
-                            try:
-                                detail_res = requests.get(
-                                    f"{FREEMAIL_API_URL.rstrip('/')}/api/email/{mail_id}",
-                                    headers=headers,
-                                    proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                                )
-                                if detail_res.status_code == 200:
-                                    detail = detail_res.json()
-                                    content = "\n".join(filter(None, [
-                                        str(detail.get("subject") or ""),
-                                        str(detail.get("content") or ""),
-                                        str(detail.get("html_content") or ""),
-                                    ]))
-                                    code = _extract_otp_code(content)
-                            except Exception:
-                                pass
-                        
-                        if code:
-                            processed_mail_ids.add(mail_id)
-                            print(f" 提取成功: {code}")
-                            return code
-            else:
-                if jwt:
-                    res = requests.get(
-                        f"{base_url}/api/mails",
-                        params={"limit": 20, "offset": 0},
-                        headers={"Authorization": "Bearer " + jwt, "Content-Type": "application/json", "Accept": "application/json"},
-                        proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                    )
-                else:
-                    res = requests.get(
-                        f"{base_url}/admin/mails",
-                        params={"limit": 20, "offset": 0, "address": email},
-                        headers={"x-admin-auth": ADMIN_AUTH},
-                        proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                    )
-                
-                if res.status_code != 200:
-                    print(f"\n[{ts()}] [ERROR] 邮箱接口请求失败 (HTTP {res.status_code}): {res.text}")
-                    time.sleep(3)
-                    continue
-
-                results = res.json().get("results")
-                if results and len(results) > 0:
-                    for mail in results:
-                        mail_id = mail.get("id")
-                        if not mail_id or mail_id in processed_mail_ids:
-                            continue
-
-                        parsed = _extract_mail_fields(mail)
-                        content = f"{parsed['subject']}\n{parsed['body']}".strip()
-
-                        if "openai" not in parsed["sender"].lower() and "openai" not in content.lower():
-                            continue
-
-                        match = re.search(pattern, content)
-                        if match:
-                            code = match.group(1)
-                            processed_mail_ids.add(mail_id)
-                            print(f" 提取成功: {code}")
-                            return code
-                    print(".", end="", flush=True)
-                else:
-                    print(".", end="", flush=True)
-        except Exception as e:
-            print(".", end="", flush=True)
-
-        time.sleep(3)
-
-    print(f"\n[{ts()}] [ERROR] 接收验证码超时")
-    return ""
-
-def _b64url_no_pad(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-def _sha256_b64url_no_pad(s: str) -> str:
-    return _b64url_no_pad(hashlib.sha256(s.encode("ascii")).digest())
-
-def _random_state(nbytes: int = 16) -> str:
-    return secrets.token_urlsafe(nbytes)
-
-def _pkce_verifier() -> str:
-    return secrets.token_urlsafe(64)
-
-def _parse_callback_url(callback_url: str) -> Dict[str, Any]:
-    candidate = callback_url.strip()
-    if not candidate: return {"code": "", "state": "", "error": "", "error_description": ""}
-    if "://" not in candidate:
-        if candidate.startswith("?"): candidate = f"http://localhost{candidate}"
-        elif any(ch in candidate for ch in "/?#") or ":" in candidate: candidate = f"http://{candidate}"
-        elif "=" in candidate: candidate = f"http://localhost/?{candidate}"
-    parsed = urllib.parse.urlparse(candidate)
-    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-    fragment = urllib.parse.parse_qs(parsed.fragment, keep_blank_values=True)
-    for key, values in fragment.items():
-        if key not in query or not query[key] or not (query[key][0] or "").strip(): query[key] = values
-    def get1(k: str) -> str:
-        v = query.get(k, [""]); return (v[0] or "").strip()
-    code = get1("code"); state = get1("state"); error = get1("error"); error_description = get1("error_description")
-    if code and not state and "#" in code: code, state = code.split("#", 1)
-    if not error and error_description: error, error_description = error_description, ""
-    return {"code": code, "state": state, "error": error, "error_description": error_description}
-
-def _jwt_claims_no_verify(id_token: str) -> Dict[str, Any]:
-    if not id_token or id_token.count(".") < 2: return {}
-    payload_b64 = id_token.split(".")[1]
-    pad = "=" * ((4 - (len(payload_b64) % 4)) % 4)
-    try:
-        payload = base64.urlsafe_b64decode((payload_b64 + pad).encode("ascii"))
-        return json.loads(payload.decode("utf-8"))
-    except Exception: return {}
-
-def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
-    raw = (seg or "").strip()
-    if not raw: return {}
-    pad = "=" * ((4 - (len(raw) % 4)) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii"))
-        return json.loads(decoded.decode("utf-8"))
-    except Exception: return {}
-
-def _to_int(v: Any) -> int:
-    try: return int(v)
-    except (TypeError, ValueError): return 0
-
-def _post_form(url: str, data: Dict[str, str], proxies: Any = None, timeout: int = 30, retries: int = 3) -> Dict[str, Any]:
-    last_error: Optional[Exception] = None
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded", 
-        "Accept": "application/json"
-    }
-    headers.update(_make_trace_headers())
-    
-    for attempt in range(retries + 1):
-        try:
-            resp = requests.post(
-                url, data=data, headers=headers, 
-                proxies=proxies, verify=_ssl_verify(), 
-                timeout=timeout, impersonate="chrome110"
-            )
-            if resp.status_code != 200: 
-                raise RuntimeError(f"token exchange failed: {resp.status_code}: {resp.text}")
-            return resp.json()
-        except Exception as exc:
-            last_error = exc
-            if attempt < retries: 
-                print(f"\n[{ts()}] [WARNING] 换取 Token 时遇到网络异常: {exc}。")
-                print(f"[{ts()}] [INFO] 正在给代理缓冲时间，准备第 {attempt + 1}/{retries} 次重试...")
-                time.sleep(2 * (attempt + 1))
-            else: 
-                break
-    raise RuntimeError(f"token exchange request failed after {retries} retries: {last_error}") from last_error
-
-def _post_with_retry(
-    session: requests.Session, url: str, *, headers: Dict[str, Any], data: Any = None,
-    json_body: Any = None, proxies: Any = None, timeout: int = 30, retries: int = 2,
-    allow_redirects: bool = True
-) -> Any:
-    last_error: Optional[Exception] = None
-    enriched_headers = headers.copy()
-    enriched_headers.update(_make_trace_headers())
-    for attempt in range(retries + 1):
-        try:
-            if json_body is not None:
-                return session.post(url, headers=enriched_headers, json=json_body, proxies=proxies, verify=_ssl_verify(), timeout=timeout, allow_redirects=allow_redirects)
-            return session.post(url, headers=enriched_headers, data=data, proxies=proxies, verify=_ssl_verify(), timeout=timeout, allow_redirects=allow_redirects)
-        except Exception as e:
-            last_error = e
-            if attempt >= retries: break
-            time.sleep(2 * (attempt + 1))
-    if last_error: raise last_error
-    raise RuntimeError("Request failed without exception")
-
-def _make_trace_headers() -> dict:
-    return {}
-
-@dataclass(frozen=True)
-class OAuthStart:
-    auth_url: str; state: str; code_verifier: str; redirect_uri: str
-
-def generate_oauth_url(*, redirect_uri: str = DEFAULT_REDIRECT_URI, scope: str = DEFAULT_SCOPE) -> OAuthStart:
-    """构造 OAuth 授权跳转链接"""
-    state = _random_state()
-    code_verifier = _pkce_verifier()
-    code_challenge = _sha256_b64url_no_pad(code_verifier)
-    params = {
-        "client_id": CLIENT_ID, 
-        "response_type": "code", 
-        "redirect_uri": redirect_uri, 
-        "scope": scope, 
-        "state": state, 
-        "code_challenge": code_challenge, 
-        "code_challenge_method": "S256", 
-        "prompt": "login", 
-        "id_token_add_organizations": "true", 
-        "codex_cli_simplified_flow": "true"
-    }
-    auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
-    return OAuthStart(auth_url=auth_url, state=state, code_verifier=code_verifier, redirect_uri=redirect_uri)
-
-def submit_callback_url(*, callback_url: str, expected_state: str, code_verifier: str, redirect_uri: str = DEFAULT_REDIRECT_URI, proxies: Any = None) -> str:
-    """提交回调地址并换取最终 Token 配置文件"""
-    cb = _parse_callback_url(callback_url)
-    if cb["error"]: 
-        raise RuntimeError(f"oauth error: {cb['error']}: {cb['error_description']}".strip())
-    if not cb["code"]: 
-        raise ValueError("callback url missing ?code=")
-    if not cb["state"]: 
-        raise ValueError("callback url missing ?state=")
-    if cb["state"] != expected_state: 
-        raise ValueError("state mismatch")
-    
-    token_resp = _post_form(
-        TOKEN_URL, 
-        {
-            "grant_type": "authorization_code", 
-            "client_id": CLIENT_ID, 
-            "code": cb["code"], 
-            "redirect_uri": redirect_uri, 
-            "code_verifier": code_verifier
-        }, 
-        proxies=proxies
-    )
-
-    access_token = (token_resp.get("access_token") or "").strip()
-    refresh_token = (token_resp.get("refresh_token") or "").strip()
-    id_token = (token_resp.get("id_token") or "").strip()
-    expires_in = _to_int(token_resp.get("expires_in"))
-
-    claims = _jwt_claims_no_verify(id_token)
-    email = str(claims.get("email") or "").strip()
-    auth_claims = claims.get("https://api.openai.com/auth") or {}
-    account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
-
-    now = int(time.time())
-    expired_rfc3339 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + max(expires_in, 0)))
-    now_rfc3339 = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-
-    config = {
-        "id_token": id_token, 
-        "access_token": access_token, 
-        "refresh_token": refresh_token,
-        "account_id": account_id, 
-        "last_refresh": now_rfc3339, 
-        "email": email,
-        "type": "codex", 
-        "expired": expired_rfc3339,
-    }
-    return json.dumps(config, ensure_ascii=False, separators=(",", ":"))
-
-def _generate_password(length: int = 16) -> str:
-    upper = random.choices(string.ascii_uppercase, k=2)
-    lower = random.choices(string.ascii_lowercase, k=2)
-    digits = random.choices(string.digits, k=2)
-    specials = random.choices("!@#$%&*", k=2)
-    rest_len = length - 8
-    pool = string.ascii_letters + string.digits + "!@#$%&*"
-    rest = random.choices(pool, k=rest_len)
-    chars = upper + lower + digits + specials + rest
-    random.shuffle(chars)
-    return "".join(chars)
-
-FIRST_NAMES = [
-    "James", "John", "Robert", "Michael", "William", "David", "Richard", "Joseph", "Thomas", "Charles",
-    "Emma", "Olivia", "Ava", "Isabella", "Sophia", "Mia", "Charlotte", "Amelia", "Harper", "Evelyn"
-]
-LAST_NAMES = [
-    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
-    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin"
-]
-
-def generate_random_user_info() -> dict:
-    """生成随机用户信息 (补全名+姓)"""
-    name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
-    current_year = datetime.now().year
-    birth_year = random.randint(current_year - 45, current_year - 18)
-    birth_month = random.randint(1, 12)
-    birth_day = random.randint(1, 28)
-    return {"name": name, "birthdate": f"{birth_year}-{birth_month:02d}-{birth_day:02d}"}
-
-def _oai_headers(did: str, extra: dict = None):
-    """统一生成基础请求头，完全匹配 chrome110 指纹"""
-    h = {
-        "accept": "application/json",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        "sec-ch-ua": '"Google Chrome";v="110", "Chromium";v="110", "Not_A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "oai-device-id": did,
-    }
-    if extra: 
-        h.update(extra)
-    return h
-
-def _get_sentinel_token(session: requests.Session, flow: str, proxies: Any = None) -> str:
-    """Sentinel 令牌获取"""
-    did = session.cookies.get("oai-did")
-    if not did: return ""
-    try:
-        res = session.post(
-            "https://sentinel.openai.com/backend-api/sentinel/req",
-            headers={
-                "Origin": "https://sentinel.openai.com",
-                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-                "Content-Type": "text/plain;charset=UTF-8"
-            },
-            data=json.dumps({"p": "", "id": did, "flow": flow}),
-            proxies=proxies, verify=_ssl_verify(), timeout=15
-        )
-        token = str((res.json() or {}).get("token") or "").strip()
-        if not token: return ""
-        return json.dumps({"p": "", "t": "", "c": token, "id": did, "flow": flow}, ensure_ascii=False, separators=(",", ":"))
+        if os.path.exists("config.yaml"):
+            with open("config.yaml", "r", encoding="utf-8") as f:
+                c = yaml.safe_load(f) or {}
+                return str(c.get("web_password", "admin")).strip()
     except Exception:
+        pass
+    return "admin"
+
+async def verify_token(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="未提供有效凭证")
+    token = authorization.split(" ")[1]
+    if token not in VALID_TOKENS:
+        raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
+    return token
+
+_FREEMAIL_COOKIE_CACHE = {}
+
+def get_freemail_cookie(fm_url: str, fm_user: str, fm_pass: str, force_refresh=False) -> str:
+    """自动登录 Freemail 并获取 Session Cookie"""
+    if not fm_user: fm_user = "admin"
+    
+    cache_key = f"{fm_url}_{fm_user}_{fm_pass}"
+    if not force_refresh and cache_key in _FREEMAIL_COOKIE_CACHE:
+        return _FREEMAIL_COOKIE_CACHE[cache_key]
+        
+    try:
+        req_url = f"{fm_url}/api/login"
+        payload = json.dumps({"username": fm_user, "password": fm_pass}).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
+        
+        print(f"[{core_engine.ts()}] [INFO] 正在尝试登录 Freemail...")
+        r = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
+        
+        try:
+            resp = urllib.request.urlopen(r, timeout=10)
+        except urllib.error.HTTPError as e:
+            err_msg = e.read().decode('utf-8')
+            print(f"[{core_engine.ts()}] [ERROR] Freemail 登录被拒绝 (HTTP {e.code}): {err_msg}")
+            return ""
+
+        cookie_headers = resp.headers.get_all('Set-Cookie') or []
+        for ch in cookie_headers:
+            for part in ch.split(';'):
+                if part.strip().startswith('mailfree-session='):
+                    cookie_val = part.strip()
+                    _FREEMAIL_COOKIE_CACHE[cache_key] = cookie_val
+                    return cookie_val
+                    
+        print(f"[{core_engine.ts()}] [WARNING] 登录成功，但未在响应头中找到 mailfree-session")
+        return ""
+    except Exception as e:
+        print(f"[{core_engine.ts()}] [ERROR] Freemail 自动登录异常: {e}")
         return ""
 
-def _follow_redirect_chain_local(session: requests.Session, start_url: str, proxies: Any = None, max_redirects: int = 12) -> Tuple[Any, str]:
-    """模拟真实浏览器处理连续的 30x 跳转与状态流转"""
-    current_url = start_url
-    response = None
-    for _ in range(max_redirects):
-        try:
-            response = session.get(current_url, allow_redirects=False, proxies=proxies, verify=_ssl_verify(), timeout=15)
-            if response.status_code not in [301, 302, 303, 307, 308]: 
-                return response, current_url
-            loc = response.headers.get("Location", "")
-            if not loc: 
-                return response, current_url
-            current_url = urllib.parse.urljoin(current_url, loc)
-            if "code=" in current_url and "state=" in current_url: 
-                return None, current_url
-        except Exception:
-            return None, current_url
-    return response, current_url
+def dispatch_email_backend_add(domain_name: str, cf_cfg: dict):
+    email_api_mode = cf_cfg.get("email_api_mode", "")
+    enable_sub_domains = cf_cfg.get("enable_sub_domains", False)
 
-def _extract_next_url(data: Dict[str, Any]) -> str:
-    """从响应中提取下一次跳转的 URL 或页面类型"""
-    continue_url = str(data.get("continue_url") or "").strip()
-    if continue_url: 
-        return continue_url
+    if not enable_sub_domains:
+        return
 
-    page_type = str((data.get("page") or {}).get("type") or "").strip()
-    mapping = {
-        "email_otp_verification": "https://auth.openai.com/email-verification", 
-        "sign_in_with_chatgpt_codex_consent": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent", 
-        "workspace": "https://auth.openai.com/workspace"
-    }
-    return mapping.get(page_type, "")
-
-def perform_registration(proxies: Any, processed_mails: set) -> tuple:
-    """注册账号的主流程，返回状态及上下文数据"""
-    s_reg = requests.Session(proxies=proxies, impersonate="chrome110")
-    s_reg.timeout = 30
-
-    if not _skip_net_check():
-        try:
-            start_time = time.time()
-            res = s_reg.get("https://cloudflare.com/cdn-cgi/trace", proxies=proxies, verify=_ssl_verify(), timeout=10)
-            elapsed = time.time() - start_time
-            trace = res.text
+    if email_api_mode == "freemail":
+        fm_cfg = cf_cfg.get("freemail", {})
+        fm_url = fm_cfg.get("api_url", "").rstrip("/")
+        fm_user = fm_cfg.get("admin_username", "admin")
+        fm_pass = fm_cfg.get("admin_password", "") 
+        
+        if fm_url and fm_pass:
+            cookie = get_freemail_cookie(fm_url, fm_user, fm_pass)
+            if not cookie: return
             
-            loc = (re.search(r"^loc=(.+)$", trace, re.MULTILINE) or [None, None])[1]
-            if loc in ("CN", "HK"): raise RuntimeError(f"当前代理所在地不支持 OpenAI ({loc})")
-            print(f"[{ts()}] [INFO] 节点测活成功！地区: {loc} | 延迟: {elapsed:.2f}s")
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] 代理网络检查失败: {e}")
-            return "fail", None
-
-    email, email_jwt = get_email_and_token(proxies)
-    if not email: return "fail", None
-
-    password = _generate_password()
-    print(f"[{ts()}] [INFO] 提交注册信息 (密码: {password[:4]}****)")
-
-    oauth_reg = generate_oauth_url()
-    s_reg.get(oauth_reg.auth_url, proxies=proxies, verify=True, timeout=15)
-    did = s_reg.cookies.get("oai-did") or ""
-    
-    if not did:
-        print(f"[{ts()}] [WARNING] 未获取到 oai-did，节点环境可能被关注。")
-    
-    print(f"[{ts()}] [INFO] 正在计算风控算力挑战...")
-    sentinel_reg = _get_sentinel_token(s_reg, "authorize_continue", proxies)
-    
-    signup_resp = _post_with_retry(
-        s_reg, "https://auth.openai.com/api/accounts/authorize/continue",
-        headers=_oai_headers(did, {
-            "Referer": "https://auth.openai.com/create-account", 
-            "openai-sentinel-token": sentinel_reg,
-            "content-type": "application/json"
-        }),
-        json_body={"username":{"value":email,"kind":"email"},"screen_hint":"signup"},
-        proxies=proxies
-    )
-    
-    # if signup_resp.status_code == 403:
-        # print(f"[{ts()}] [WARNING] {email} 注册请求触发 403 拦截，稍作等待后重试...")
-        # return "retry_403", None
-    if signup_resp.status_code != 200:
-        print(f"[{ts()}] [ERROR] 注册表单提交失败，中断当前流程: {signup_resp.text}")
-        return "fail", None
-
-    pwd_resp = _post_with_retry(
-        s_reg, "https://auth.openai.com/api/accounts/user/register",
-        headers=_oai_headers(did, {
-            "Referer": "https://auth.openai.com/create-account/password", 
-            "openai-sentinel-token": sentinel_reg,
-            "content-type": "application/json"
-        }),
-        json_body={"password": password, "username": email},
-        proxies=proxies
-    )
-    
-    if pwd_resp.status_code != 200:
-        print(f"[{ts()}] [ERROR] 密码注册环节异常: {pwd_resp.text}")
-        return "fail", None
-
-    try:
-        reg_json = pwd_resp.json()
-        need_otp = "verify" in reg_json.get("continue_url", "") or "otp" in (reg_json.get("page") or {}).get("type", "")
-    except Exception:
-        need_otp = False
-
-    if need_otp:
-        otp_url = reg_json.get("continue_url", "")
-        if otp_url:
-            _post_with_retry(
-                s_reg, otp_url if otp_url.startswith("http") else f"https://auth.openai.com{otp_url}", 
-                headers={
-                    "Referer": "https://auth.openai.com/create-account/password",
-                    "openai-sentinel-token": sentinel_reg, 
-                    "content-type": "application/json"
-                }, 
-                json_body={}, proxies=proxies, timeout=30
-            )
-        
-        code = ""
-        for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
-            if resend_attempt > 0:
-                print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
-                try:
-                    _post_with_retry(
-                        s_reg, "https://auth.openai.com/api/accounts/email-otp/resend", 
-                        headers={"openai-sentinel-token": sentinel_reg, "content-type": "application/json"}, 
-                        json_body={}, proxies=proxies, timeout=15
-                    )
-                    time.sleep(2)  
-                except Exception as e:
-                    print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
-            
-            code = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
-            if code: break
-
-        if not code:
-            print(f"[{ts()}] [ERROR] 重试次数上限，丢弃当前邮箱。")
-            return "fail", None
-        
-        code_resp = _post_with_retry(
-            s_reg, "https://auth.openai.com/api/accounts/email-otp/validate", 
-            headers={
-                "Referer": "https://auth.openai.com/email-verification",
-                "openai-sentinel-token": sentinel_reg, 
-                "content-type": "application/json"
-            }, 
-            json_body={"code": code}, proxies=proxies
-        )
-        if code_resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 验证码校验未通过: {code_resp.text}")
-            return "fail", None
-
-    user_info = generate_random_user_info()
-    print(f"[{ts()}] [INFO] 初始化账户基础信息 (昵称: {user_info['name']}, 生日: {user_info['birthdate']})...")
-    user_info = generate_random_user_info()
-    create_account_resp = _post_with_retry(
-        s_reg, "https://auth.openai.com/api/accounts/create_account", 
-        headers=_oai_headers(did, {"Referer": "https://auth.openai.com/about-you", "content-type": "application/json"}), 
-        json_body=user_info, proxies=proxies
-    )
-    
-    if create_account_resp.status_code != 200:
-        print(f"[{ts()}] [ERROR] 账户创建受阻: 遭遇拦截，响应代码 {create_account_resp.status_code}")
-        return "fail", None
-
-    auth_cookie = s_reg.cookies.get("oai-client-auth-session")
-    has_workspace = False
-    if auth_cookie and "." in auth_cookie:
-        try:
-            claims = _decode_jwt_segment(auth_cookie.split(".")[0])
-            if claims.get("workspaces"): 
-                has_workspace = True
-        except: pass
-        
-    if has_workspace:
-        print(f"[{ts()}] [SUCCESS] 正在提取最终凭据...")
-        oauth_log = generate_oauth_url()
-        _, final_url = _follow_redirect_chain_local(s_reg, oauth_log.auth_url, proxies)
-        
-        if "code=" in final_url and "state=" in final_url:
-            result = submit_callback_url(
-                callback_url=final_url, 
-                expected_state=oauth_log.state, 
-                code_verifier=oauth_log.code_verifier, 
-                proxies=proxies
-            ), password
-            return "done", result
-        else:
-            return "fail", None
-    else:
-        return "need_login", (email, password, email_jwt)
-
-def perform_silent_login(email: str, password: str, email_jwt: str, proxies: Any, processed_mails: set) -> tuple:
-    """OAuth 静默重登录流程"""
-    print(f"[{ts()}] [INFO] 基础信息建立完毕，执行静默风控重登录...")
-    s_log = requests.Session(proxies=proxies, impersonate="chrome110")
-    oauth_log = generate_oauth_url()
-    
-    resp, current_url = _follow_redirect_chain_local(s_log, oauth_log.auth_url, proxies)
-    if "code=" in current_url and "state=" in current_url:
-        return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
-
-    sentinel_log = _get_sentinel_token(s_log, "authorize_continue", proxies)
-    login_start_resp = _post_with_retry(
-        s_log, "https://auth.openai.com/api/accounts/authorize/continue", 
-        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
-            "Referer": current_url,
-            "openai-sentinel-token": sentinel_log, 
-            "content-type": "application/json"
-        }), 
-        json_body={"username":{"value":email,"kind":"email"}}, proxies=proxies, allow_redirects=False
-    )
-    
-    pwd_page_url = str((login_start_resp.json() if login_start_resp.status_code == 200 else {}).get("continue_url") or "").strip()
-    resp, current_url = _follow_redirect_chain_local(s_log, pwd_page_url, proxies)
-
-    sentinel_pwd = _get_sentinel_token(s_log, "password_verify", proxies)
-    pwd_login_resp = _post_with_retry(
-        s_log, "https://auth.openai.com/api/accounts/password/verify", 
-        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {
-            "Referer": current_url,
-            "openai-sentinel-token": sentinel_pwd, 
-            "content-type": "application/json"
-        }), 
-        json_body={"password": password}, proxies=proxies
-    )
-
-    pwd_json = pwd_login_resp.json() if pwd_login_resp.status_code == 200 else {}
-    next_url = str(pwd_json.get("continue_url") or "").strip()
-    if not next_url:
-        ptype = str(pwd_json.get("page", {}).get("type") or "").strip()
-        if ptype == "email_otp_verification": 
-            next_url = "https://auth.openai.com/email-verification"
-        elif ptype == "sign_in_with_chatgpt_codex_consent": 
-            next_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
-        elif ptype == "workspace": 
-            next_url = "https://auth.openai.com/workspace"
-
-    resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
-    
-    if current_url.endswith("/email-verification"):
-        code2 = ""
-        time.sleep(5)
-        for resend_attempt in range(max(1, MAX_OTP_RETRIES)):
-            if resend_attempt > 0:
-                print(f"\n[{ts()}] [INFO] 正在重试 {resend_attempt}/5...")
-                try:
-                    _post_with_retry(
-                        s_log, "https://auth.openai.com/api/accounts/email-otp/resend", 
-                        headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-                        json_body={}, proxies=proxies, timeout=15
-                    )
-                    time.sleep(2)
-                except Exception as e:
-                    print(f"[{ts()}] [WARNING] 重新发送请求异常: {e}")
-        
-            code2 = get_oai_code(email, jwt=email_jwt, proxies=proxies, processed_mail_ids=processed_mails)
-            if code2: break 
-
-        if not code2:
-            print(f"[{ts()}] [ERROR] 重新发送后依然未收到验证码，彻底放弃。")
-            return None, None
-            
-        code2_resp = _post_with_retry(
-            s_log, "https://auth.openai.com/api/accounts/email-otp/validate", 
-            headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-            json_body={"code": code2}, proxies=proxies
-        )
-        if code2_resp.status_code != 200:
-            print(f"[{ts()}] [ERROR] 二次安全验证 OTP 校验失败: {code2_resp.text}")
-            return None, None
-        
-        next_url = str(code2_resp.json().get("continue_url") or "").strip()
-        resp, current_url = _follow_redirect_chain_local(s_log, next_url, proxies)
-
-    if "code=" in current_url and "state=" in current_url:
-        return submit_callback_url(callback_url=current_url, code_verifier=oauth_log.code_verifier, redirect_uri=oauth_log.redirect_uri, expected_state=oauth_log.state, proxies=proxies), password
-
-    if current_url.endswith("/consent") or current_url.endswith("/workspace"):
-        auth_cookie2 = s_log.cookies.get("oai-client-auth-session")
-        if auth_cookie2:
-            workspaces = _decode_jwt_segment(auth_cookie2.split(".")[0]).get("workspaces") or []
-            if workspaces:
-                select_resp = _post_with_retry(
-                    s_log, 
-                    "https://auth.openai.com/api/accounts/workspace/select", 
-                    headers=_oai_headers(s_log.cookies.get("oai-did") or "", {"Referer": current_url, "content-type": "application/json"}), 
-                    json_body={"workspace_id": str(workspaces[0].get("id"))}, 
-                    proxies=proxies
-                )
-                final_url = _extract_next_url(select_resp.json()) if select_resp.status_code == 200 else ""
-                _, final_loc = _follow_redirect_chain_local(s_log, final_url, proxies)
-                if "code=" in final_loc:
-                    return submit_callback_url(callback_url=final_loc, expected_state=oauth_log.state, code_verifier=oauth_log.code_verifier, proxies=proxies), password
-
-    print(f"[{ts()}] [ERROR] OAuth 授权链路追踪失败 (最终停留在: {current_url})")
-    return None, None
-
-
-
-def run(proxy: Optional[str]) -> tuple:
-    """调度器"""
-    processed_mails = set()
-    if proxy and proxy.startswith("socks5://"):
-        proxy = proxy.replace("socks5://", "socks5h://")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    
-    try:
-        reg_status, reg_result = perform_registration(proxies, processed_mails)
-        
-        if reg_status == "fail":
-            return None, None
-        elif reg_status == "retry_403":
-            return "retry_403", None
-        elif reg_status == "done":
-            return reg_result
-        elif reg_status == "need_login":
-            email, password, email_jwt = reg_result
-            
-            wait_time = random.randint(LOGIN_DELAY_MIN, LOGIN_DELAY_MAX)
-            print(f"[{ts()}] [INFO] 注册通过，等待 {wait_time} 秒后发起静默登录...")
-            time.sleep(wait_time)
-            return perform_silent_login(email, password, email_jwt, proxies, processed_mails)
-            
-        return None, None
-        
-    except Exception as e:
-        import traceback
-        print(f"[{ts()}] [ERROR] 注册主流程发生严重异常: {e}")
-        return None, None
-
-def _normalize_cpa_auth_files_url(api_url: str) -> str:
-    normalized = (api_url or "").strip().rstrip("/")
-    lower_url = normalized.lower()
-    if not normalized: return ""
-    if lower_url.endswith("/auth-files"): return normalized
-    if lower_url.endswith("/v0/management") or lower_url.endswith("/management"): return f"{normalized}/auth-files"
-    if lower_url.endswith("/v0"): return f"{normalized}/management/auth-files"
-    return f"{normalized}/v0/management/auth-files"
-
-def set_cpa_auth_file_status(api_url: str, api_token: str, filename: str, disabled: bool = True) -> bool:
-    """设置 CPA 中凭证的启用/禁用状态"""
-    base_url = _normalize_cpa_auth_files_url(api_url)
-    status_url = f"{base_url}/status"
-    
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "name": filename,
-        "disabled": disabled
-    }
-    
-    try:
-        res = requests.patch(status_url, headers=headers, json=payload, timeout=15, impersonate="chrome110")
-        if res.status_code in (200, 204):
-            return True
-        else:
-            print(f"[{ts()}] [ERROR] 切换凭证状态失败 (HTTP {res.status_code}): {res.text}")
-            return False
-    except Exception as e:
-        print(f"[{ts()}] [ERROR] 切换凭证状态异常: {e}")
-        return False
-
-
-def upload_to_cpa_integrated(token_data: dict, api_url: str, api_token: str, custom_filename: str = None) -> Tuple[bool, str]:
-    upload_url = _normalize_cpa_auth_files_url(api_url)
-    
-    filename = custom_filename if custom_filename else f"{token_data.get('email', 'unknown')}.json"
-    
-    file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
-    try:
-        mime = CurlMime()
-        mime.addpart(name="file", data=file_content, filename=filename, content_type="application/json")
-        response = requests.post(upload_url, multipart=mime, headers={"Authorization": f"Bearer {api_token}"}, timeout=30, impersonate="chrome110")
-        if response.status_code in (200, 201): return True, "上传成功"
-        
-        if response.status_code in (404, 405, 415):
-            raw_upload_url = f"{upload_url}?name={urllib.parse.quote(filename)}"
-            fallback_res = requests.post(raw_upload_url, data=file_content, headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}, timeout=30, impersonate="chrome110")
-            if fallback_res.status_code in (200, 201): return True, "上传成功"
-            response = fallback_res
-        return False, f"HTTP {response.status_code}"
-    except Exception as e: return False, str(e)
-
-def _decode_possible_json_payload(payload: Any) -> Any:
-    if isinstance(payload, str):
-        text = payload.strip()
-        if not text: return payload
-        try: return json.loads(text)
-        except Exception: return payload
-    return payload
-
-def _extract_remaining_percent(window_info: Any) -> Optional[float]:
-    if not isinstance(window_info, dict): return None
-    remaining_percent = window_info.get("remaining_percent")
-    if isinstance(remaining_percent, (int, float)): return max(0.0, min(100.0, float(remaining_percent)))
-    used_percent = window_info.get("used_percent")
-    if isinstance(used_percent, (int, float)): return max(0.0, min(100.0, 100.0 - float(used_percent)))
-    return None
-
-def _format_percent(value: float) -> str:
-    normalized = round(float(value), 2)
-    if normalized.is_integer(): return str(int(normalized))
-    return f"{normalized:.2f}".rstrip("0").rstrip(".")
-
-def _format_known_cliproxy_error(error_type: str) -> str:
-    label = KNOWN_CLIPROXY_ERROR_LABELS.get(error_type)
-    if label: return f"{label} ({error_type})"
-    return f"错误类型: {error_type}"
-
-def _extract_rate_limit_reason(rate_info: Any, key: str, min_remaining_weekly_percent: int = 0) -> Optional[str]:
-    if not isinstance(rate_info, dict): return None
-    allowed = rate_info.get("allowed")
-    limit_reached = rate_info.get("limit_reached")
-    if allowed is False or limit_reached is True:
-        label_map = {"rate_limit": "周限额已耗尽", "code_review_rate_limit": "代码审查周限额已耗尽"}
-        label = label_map.get(key, f"{key} 已耗尽")
-        return f"{label}（allowed={allowed}, limit_reached={limit_reached}）"
-
-    if key == "rate_limit" and min_remaining_weekly_percent > 0:
-        remaining_percent = _extract_remaining_percent(rate_info.get("primary_window"))
-        if remaining_percent is not None and remaining_percent < min_remaining_weekly_percent:
-            return f"周限额剩余 {_format_percent(remaining_percent)}%，低于阈值 {min_remaining_weekly_percent}%"
-    return None
-
-def _extract_cliproxy_failure_reason(payload: Any, min_remaining_weekly_percent: int = 0) -> Optional[str]:
-    data = _decode_possible_json_payload(payload)
-
-    if isinstance(data, str):
-        for keyword in ("usage_limit_reached", "account_deactivated", "insufficient_quota", "invalid_api_key", "unsupported_region"):
-            if keyword in data: return _format_known_cliproxy_error(keyword)
-        return None
-
-    if not isinstance(data, dict): return None
-
-    error = data.get("error")
-    if isinstance(error, dict):
-        err_type = error.get("type")
-        if err_type: return _format_known_cliproxy_error(err_type)
-        message = error.get("message")
-        if message: return str(message)
-
-    for key in ("rate_limit", "code_review_rate_limit"):
-        min_remaining_percent = min_remaining_weekly_percent if key == "rate_limit" else 0
-        reason = _extract_rate_limit_reason(data.get(key), key, min_remaining_percent)
-        if reason: return reason
-
-    additional_rate_limits = data.get("additional_rate_limits")
-    if isinstance(additional_rate_limits, list):
-        for index, rate_info in enumerate(additional_rate_limits):
-            reason = _extract_rate_limit_reason(rate_info, f"additional_rate_limits[{index}]", 0)
-            if reason: return reason
-    elif isinstance(additional_rate_limits, dict):
-        for key, rate_info in additional_rate_limits.items():
-            reason = _extract_rate_limit_reason(rate_info, f"additional_rate_limits.{key}", 0)
-            if reason: return reason
-
-    for key in ("data", "body", "response", "text", "content", "status_message"):
-        reason = _extract_cliproxy_failure_reason(data.get(key), min_remaining_weekly_percent)
-        if reason: return reason
-
-    data_str = json.dumps(data, ensure_ascii=False)
-    for keyword in ("usage_limit_reached", "account_deactivated", "insufficient_quota", "invalid_api_key", "unsupported_region"):
-        if keyword in data_str: return _format_known_cliproxy_error(keyword)
-
-    return None
-
-def refresh_oauth_token(refresh_token: str, proxies: Any = None) -> Tuple[bool, dict]:
-    """刷新获取新的 access_token 等凭证"""
-    if not refresh_token:
-        return False, {"error": "无 refresh_token"}
-    try:
-        resp = requests.post(
-            TOKEN_URL,
-            data={
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "redirect_uri": DEFAULT_REDIRECT_URI
-            },
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json"
-            },
-            proxies=proxies,
-            verify=_ssl_verify(),
-            timeout=30,
-            impersonate="chrome110"
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            now = int(time.time())
-            expires_in = _to_int(data.get("expires_in", 3600))
-            return True, {
-                "access_token": data.get("access_token"),
-                "refresh_token": data.get("refresh_token", refresh_token),
-                "id_token": data.get("id_token"),
-                "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-                "expired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + max(expires_in, 0)))
-            }
-        # return False, {"error": f"HTTP {resp.status_code}: {resp.text}"}
-        return False, {"error": f"HTTP {resp.status_code}"}
-    except Exception as e:
-        return False, {"error": str(e)}
-
-def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> Tuple[bool, str]:
-    auth_index = item.get("auth_index")
-    base_url = api_url.strip().rstrip("/")
-    call_url = base_url.replace("/auth-files", "/api-call") if "/auth-files" in base_url else f"{base_url}/v0/management/api-call"
-    payload = {
-        "authIndex": auth_index, 
-        "method": "GET", 
-        "url": "https://chatgpt.com/backend-api/wham/usage", 
-        "header": {
-            "Authorization": "Bearer $TOKEN$", 
-            "Content-Type": "application/json", 
-            "User-Agent": DEFAULT_CLIPROXY_UA, 
-            "Chatgpt-Account-Id": str(item.get("account_id") or "")
-        }
-    }
-    try:
-        resp = requests.post(call_url, headers={"Authorization": f"Bearer {api_token}"}, json=payload, timeout=60, impersonate="chrome110")
-        if resp.status_code != 200:
-            return False, f"HTTP {resp.status_code}"
-            
-        data = resp.json()
-        status_code = data.get("status_code", 0)
-        
-        failure_reason = _extract_cliproxy_failure_reason(data, MIN_REMAINING_WEEKLY_PERCENT)
-        
-        if status_code >= 400 or failure_reason:
-            return False, failure_reason or f"HTTP {status_code}"
-            
-        return True, "正常"
-    except Exception: 
-        return False, "测活超时"
-
-def process_account_worker(i: int, total: int, item: dict, args: Any) -> bool:
-    """多线程处理单个账号的测活与状态流转"""
-    name = item.get("name")
-    is_disabled = item.get("disabled", False) 
-    
-    is_ok, msg = test_cliproxy_auth_file(item, CPA_API_URL, CPA_API_TOKEN)
-    
-    if is_ok:
-        if is_disabled:
-            print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 额度已恢复且有效，准备启用...")
-            if set_cpa_auth_file_status(CPA_API_URL, CPA_API_TOKEN, name, disabled=False):
-                print(f"[{ts()}] [SUCCESS] 凭证 {mask_email(name)} 已成功启用！")
-                return True
-            else:
-                print(f"[{ts()}] [ERROR] 凭证 {mask_email(name)} 启用失败。")
-                return False
-        else:
-            print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 状态健康")
-            return True
-            
-    else:
-        print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 失效，原因: {msg}")
-        
-        if "周限额" in msg or "usage_limit_reached" in msg:
-            if REMOVE_ON_LIMIT_REACHED:
-                print(f"[{ts()}] [INFO] 触发限额剔除规则，执行物理剔除...")
-                requests.delete(
-                    _normalize_cpa_auth_files_url(CPA_API_URL), 
-                    headers={"Authorization": f"Bearer {CPA_API_TOKEN}"}, 
-                    params={"name": name}
-                )
-            else:
-                if not is_disabled:
-                    print(f"[{ts()}] [INFO] 测活: 凭证额度耗尽或低于设定值，正在将其状态设置为 [禁用]...")
-                    if set_cpa_auth_file_status(CPA_API_URL, CPA_API_TOKEN, name, disabled=True):
-                        print(f"[{ts()}] [SUCCESS] 测活: 凭证 {mask_email(name)} 已成功禁用，等待额度重置。")
-                    else:
-                        print(f"[{ts()}] [ERROR] 测活: 凭证 {mask_email(name)} 禁用失败！")
-                else:
-                    print(f"[{ts()}] [INFO] 测活: 账号额度尚未恢复，继续保持禁用状态。")
-            return False
-
-        if not ENABLE_TOKEN_REVIVE:
-            print(f"[{ts()}] [INFO] 检测到 Token 已失效，但【复活】已关闭，仅记录状态。")
-            if REMOVE_DEAD_ACCOUNTS:
-                print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 彻底死亡，执行物理剔除...")
-                requests.delete(
-                    _normalize_cpa_auth_files_url(CPA_API_URL), 
-                    headers={"Authorization": f"Bearer {CPA_API_TOKEN}"}, 
-                    params={"name": name}
-                )
-            else:
-                if not is_disabled:
-                    print(f"[{ts()}] [INFO] 测活: 凭证 {mask_email(name)} ，根据配置保留不删除，正在将其(禁用)...")
-                    if set_cpa_auth_file_status(CPA_API_URL, CPA_API_TOKEN, name, disabled=True):
-                        print(f"[{ts()}] [SUCCESS] 测活: 死亡凭证 {mask_email(name)} 已成功禁用。")
-                else:
-                    print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 已死亡，当前已是禁用状态，根据配置保留不删除。")
-            return False
-
-        print(f"[{ts()}] [INFO] 测活: 凭证 {mask_email(name)} 准备尝试刷新 Token 复活...")
-        refresh_success = False
-        
-        is_runtime_only = item.get("runtime_only", False)
-        source_type = item.get("source", "")
-        
-        if is_runtime_only or source_type == "memory":
-            print(f"[{ts()}] [WARNING] {mask_email(name)} 属于纯内存凭据，跳过抢救。")
-            full_item_data = {}
-        else:
             try:
-                base_auth_url = _normalize_cpa_auth_files_url(CPA_API_URL)
-                download_url = f"{base_auth_url}/download"
-                content_resp = requests.get(
-                    download_url, 
-                    params={"name": name}, 
-                    headers={"Authorization": f"Bearer {CPA_API_TOKEN}"}, 
-                    timeout=20
-                )
-                if content_resp.status_code == 200:
-                    full_item_data = content_resp.json()
+                req_url = f"{fm_url}/api/domains"
+                headers = {
+                    "Cookie": cookie,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                }
+                payload = json.dumps({"domain": domain_name}).encode("utf-8")
+                
+                print(f"[{core_engine.ts()}] [INFO] 正在向 Freemail 推送: {domain_name}")
+                r = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
+                resp = urllib.request.urlopen(r, timeout=10)
+                
+                print(f"[{core_engine.ts()}] [SUCCESS] Freemail 接收成功")
+                
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    print(f"[{core_engine.ts()}] [WARNING] Cookie 可能已失效，准备触发重新登录...")
+                    get_freemail_cookie(fm_url, fm_user, fm_pass, force_refresh=True)
                 else:
-                    print(f"[{ts()}] [ERROR] 获取 {mask_email(name)} 完整内容失败 (HTTP {content_resp.status_code})")
-                    full_item_data = {}
+                    err_msg = e.read().decode('utf-8')
+                    print(f"[{core_engine.ts()}] [ERROR] Freemail 拒绝推送 (HTTP {e.code}): {err_msg}")
             except Exception as e:
-                print(f"[{ts()}] [ERROR] 获取 {mask_email(name)} 完整内容异常: {e}")
-                full_item_data = {}
+                print(f"[{core_engine.ts()}] [ERROR] Freemail 请求异常: {e}")
 
-        refresh_token = full_item_data.get("refresh_token")
+def dispatch_email_backend_delete(domain_name: str, cf_cfg: dict):
+    email_api_mode = cf_cfg.get("email_api_mode", "")
+    enable_sub_domains = cf_cfg.get("enable_sub_domains", False)
+
+    if not enable_sub_domains:
+        return
+
+    if email_api_mode == "freemail":
+        fm_cfg = cf_cfg.get("freemail", {})
+        fm_url = fm_cfg.get("api_url", "").rstrip("/")
+        fm_user = fm_cfg.get("admin_username", "admin")
+        fm_pass = fm_cfg.get("admin_password", "")
         
-        if refresh_token:
-            proxies = {"http": args.proxy, "https": args.proxy} if args.proxy else None
-            ok, new_tokens = refresh_oauth_token(refresh_token, proxies=proxies)
+        if fm_url and fm_pass:
+            cookie = get_freemail_cookie(fm_url, fm_user, fm_pass)
+            if not cookie: return
             
-            if ok:
-                print(f"[{ts()}] [INFO] {mask_email(name)} Token 刷新成功，正在同步至CPA...")
-                full_item_data.update(new_tokens)
-                if "email" not in full_item_data:
-                    full_item_data["email"] = name.replace(".json", "")
+            try:
+                req_url = f"{fm_url}/api/domains?domain={domain_name}"
+                headers = {
+                    "Cookie": cookie,
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                }
+                print(f"[{core_engine.ts()}] [INFO] 正在从 Freemail 删除: {domain_name}")
+                r = urllib.request.Request(req_url, headers=headers, method="DELETE")
+                resp = urllib.request.urlopen(r, timeout=10)
                 
-                up_ok, up_msg = upload_to_cpa_integrated(full_item_data, CPA_API_URL, CPA_API_TOKEN, custom_filename=name)
-                if up_ok:
-                    time.sleep(3)
-                    is_ok2, msg2 = test_cliproxy_auth_file(item, CPA_API_URL, CPA_API_TOKEN)
-                    if is_ok2:
-                        refresh_success = True
-                        print(f"[{ts()}] [SUCCESS] 测活: {mask_email(name)} 刷新后复活成功！")
-                    else:
-                        print(f"[{ts()}] [WARNING] {mask_email(name)} 刷新后二次测活依然失败({msg2})")
+                print(f"[{core_engine.ts()}] [SUCCESS] Freemail 删除成功")
+                
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    get_freemail_cookie(fm_url, fm_user, fm_pass, force_refresh=True)
                 else:
-                    print(f"[{ts()}] [ERROR] 刷新后覆盖CPA失败: {up_msg}")
-            else:
-                print(f"[{ts()}] [WARNING] {mask_email(name)} Token 复活请求被拒绝: {new_tokens.get('error', '未知错误')}")
-        else:
-            print(f"[{ts()}] [WARNING] {mask_email(name)} 未找到有效数据，无法抢救")
-        
-        if not refresh_success:
-            if REMOVE_DEAD_ACCOUNTS:
-                print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 彻底死亡，执行物理剔除...")
-                requests.delete(
-                    _normalize_cpa_auth_files_url(CPA_API_URL), 
-                    headers={"Authorization": f"Bearer {CPA_API_TOKEN}"}, 
-                    params={"name": name}
-                )
-            else:
-                if not is_disabled:
-                    print(f"[{ts()}] [INFO] 测活: 凭证 {mask_email(name)} ，根据配置保留不删除，正在将其(禁用)...")
-                    if set_cpa_auth_file_status(CPA_API_URL, CPA_API_TOKEN, name, disabled=True):
-                        print(f"[{ts()}] [SUCCESS] 测活: 死亡凭证 {mask_email(name)} 已成功禁用。")
-                else:
-                    print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 已死亡，当前已是禁用状态，根据配置保留不删除。")
-        return refresh_success
+                    err_msg = e.read().decode('utf-8')
+                    print(f"[{core_engine.ts()}] [ERROR] Freemail 拒绝删除 (HTTP {e.code}): {err_msg}")
+            except Exception as e:
+                print(f"[{core_engine.ts()}] [ERROR] Freemail 请求异常: {e}")
 
-def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
-    """统一处理注册返回结果，保存到本地并可选择上传CPA"""
-    if not result or result[0] is None:
-        print(f"[{ts()}] [ERROR] 本次注册任务执行失败，不计入统计。")
-        return "failed"
-        
-    token_json_str, password = result
-    if not token_json_str or token_json_str == "retry_403":
-        if token_json_str == "retry_403":
-            print(f"[{ts()}] [WARNING] 检测到 403 频率限制，挂起重试...")
-            return "retry_403"
-        return "failed"
-        
-    if token_json_str:
-        token_data = json.loads(token_json_str)
-        account_email = token_data.get('email', 'unknown')
-        
-        # 保存本地
-        if (cpa_upload and SAVE_TO_LOCAL_IN_CPA_MODE) or not cpa_upload:
-            fname_email = account_email.replace("@", "_")
-            base_dir = TOKEN_OUTPUT_DIR or "."
-            if base_dir != ".": os.makedirs(base_dir, exist_ok=True)
+@app.post("/api/login")
+async def login(data: LoginData):
+    correct_pwd = get_web_password()
+    if data.password == correct_pwd:
+        token = secrets.token_hex(16)
+        VALID_TOKENS.add(token)
+        return {"status": "success", "token": token}
+    return {"status": "error", "message": "密码错误"}
 
-            json_file_name = f"token_{fname_email}_{int(time.time())}.json"
-            json_path = os.path.join(base_dir, json_file_name)
-            with open(json_path, "w", encoding="utf-8") as f:
-                f.write(token_json_str)
-            print(f"[{ts()}] [SUCCESS] 本地 JSON 备份成功: {mask_email(json_file_name)}")
+@app.get("/api/status")
+async def get_status(token: str = Depends(verify_token)):
+    return {"is_running": engine.is_running()}
 
-            if account_email and password:
-                accounts_file = os.path.join(base_dir, "accounts.txt")
-                with open(accounts_file, "a", encoding="utf-8") as af:
-                    af.write(f"{account_email}----{password}\n")
-                print(f"[{ts()}] [SUCCESS] 账号密码已追加至本地 accounts.txt")
-                
-        # CPA 上传
-        if cpa_upload:
-            success, up_msg = upload_to_cpa_integrated(token_data, CPA_API_URL, CPA_API_TOKEN)
-            if success:
-                print(f"[{ts()}] [SUCCESS] 补货凭证 {mask_email(account_email)} 云端上传成功！")
-            else:
-                print(f"[{ts()}] [ERROR] 云端上传失败: {up_msg}")
-                
-    return "success"
-
-
-async def cpa_main_loop(args):
-    """CPA 智能仓管模式 (接入发牌器，防止撞车)"""
-    print("=" * 60)
-    print(f"   目标库存阈值: {MIN_ACCOUNTS_THRESHOLD} | 单次补发量: {BATCH_REG_COUNT}")
-    print(f"   周限额剔除规则: 剩余低于 {MIN_REMAINING_WEEKLY_PERCENT}%" if MIN_REMAINING_WEEKLY_PERCENT > 0 else "   周限额剔除规则: 完全耗尽才剔除")
-    print("=" * 60)
+@app.post("/api/start")
+async def start_task(token: str = Depends(verify_token)):
+    if engine.is_running():
+        return {"status": "error", "message": "任务已经在运行中！"}
     
-    loop = asyncio.get_running_loop()
+    try: reload_all_configs()
+    except Exception as e: print(f"[{core_engine.ts()}] [警告] 启动重载提示: {e}")
+        
+    default_proxy = getattr(core_engine.cfg, 'DEFAULT_PROXY', None)
+    args = DummyArgs(proxy=default_proxy if default_proxy else None)
 
-    while True:
-        print(f"\n[{ts()}] [INFO] 开始执行仓库例行巡检与测活...")
-        try:
-            res = requests.get(
-                _normalize_cpa_auth_files_url(CPA_API_URL), 
-                headers={"Authorization": f"Bearer {CPA_API_TOKEN}"}, 
-                timeout=20
-            )
-            all_files = res.json().get("files", [])
-            codex_files = [f for f in all_files if "codex" in str(f.get("type","")).lower() or "codex" in str(f.get("provider","")).lower()]
-            total_files = len(codex_files)
+    core_engine.run_stats["success"] = 0
+    core_engine.run_stats["failed"] = 0
+    core_engine.run_stats["retries"] = 0
+    core_engine.run_stats["start_time"] = time.time()
+
+    if getattr(core_engine.cfg, 'ENABLE_CPA_MODE', False):
+        core_engine.run_stats["target"] = 0
+        engine.start_cpa(args)
+        return {"status": "success", "message": "启动成功：已自动识别并开启 [CPA 智能仓管模式]"}
+    elif getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False):
+        engine.start_sub2api(args)
+        return {"status": "success", "message": "启动成功：已自动识别并开启 [Sub2API 仓管模式]"}
+    else:
+        core_engine.run_stats["target"] = core_engine.cfg.NORMAL_TARGET_COUNT
+        engine.start_normal(args)
+        return {"status": "success", "message": "启动成功：已自动识别并开启 [常规量产模式]"}
+
+@app.post("/api/accounts/export_selected")
+async def export_selected_accounts(req: ExportReq, token: str = Depends(verify_token)):
+    try:
+        if not req.emails:
+            return {"status": "error", "message": "未收到任何要导出的账号"}
             
-            with ThreadPoolExecutor(max_workers=CPA_THREADS) as executor:
-                futures = []
-                for i, item in enumerate(codex_files, 1):
-                    futures.append(
-                        loop.run_in_executor(executor, process_account_worker, i, total_files, item, args)
-                    )
-                results = await asyncio.gather(*futures)
+        tokens = db_manager.get_tokens_by_emails(req.emails)
+        
+        if not tokens:
+            return {"status": "error", "message": "未能提取到选中账号的有效 Token"}
             
-            valid_count = sum(1 for is_valid in results if is_valid)
-            print(f"[{ts()}] [INFO] 巡检结束，当前仓库有效数: {valid_count}")
+        return {"status": "success", "data": tokens}
+    except Exception as e:
+        return {"status": "error", "message": f"导出失败: {str(e)}"}
+
+@app.post("/api/accounts/delete")
+async def delete_selected_accounts(req: DeleteReq, token: str = Depends(verify_token)):
+    try:
+        if not req.emails:
+            return {"status": "error", "message": "未收到任何要删除的账号"}
+            
+        success = db_manager.delete_accounts_by_emails(req.emails)
+        
+        if success:
+            return {"status": "success", "message": f"成功删除 {len(req.emails)} 个账号"}
+        else:
+            return {"status": "error", "message": "删除操作失败"}
+    except Exception as e:
+        return {"status": "error", "message": f"删除异常: {str(e)}"}
+
+@app.get("/api/stats")
+async def get_stats(token: str = Depends(verify_token)):
+    stats = core_engine.run_stats
+    is_running = engine.is_running()
+    
+    elapsed = round(time.time() - stats["start_time"], 1) if (is_running and stats["start_time"] > 0) else 0
+    total_attempts = stats["success"] + stats["failed"]
+    success_rate = round((stats["success"] / total_attempts * 100), 2) if total_attempts > 0 else 0.0
+    avg_time = round(elapsed / stats["success"], 1) if stats["success"] > 0 else 0.0
+    
+    progress_pct = 0
+    if stats["target"] > 0:
+        progress_pct = min(100, round((stats["success"] / stats["target"]) * 100, 1))
+    elif stats["success"] > 0:
+        progress_pct = 100
+
+    if getattr(core_engine.cfg, 'ENABLE_CPA_MODE', False):
+        current_mode = "CPA 仓管"
+    elif getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False):
+        current_mode = "Sub2Api 仓管"
+    else:
+        current_mode = "常规量产"
+    return {
+        "success": stats["success"],
+        "failed": stats["failed"],
+        "retries": stats["retries"],
+        "total": total_attempts,
+        "target": stats["target"] if stats["target"] > 0 else "∞",
+        "success_rate": f"{success_rate}%",
+        "elapsed": f"{elapsed}s",
+        "avg_time": f"{avg_time}s",
+        "progress_pct": f"{progress_pct}%",
+        "is_running": is_running,
+        "mode": current_mode
+    }
+
+@app.post("/api/stop")
+async def stop_task(token: str = Depends(verify_token)):
+    if not engine.is_running():
+        return {"status": "warning", "message": "当前没有运行的任务"}
+    engine.stop()
+    return {"status": "success", "message": "已发送停止指令，正在安全退出..."}
+
+@app.get("/api/config")
+async def get_config(token: str = Depends(verify_token)):
+    config_path = "config.yaml"
+    config_data = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = yaml.safe_load(f) or {}
+    config_data["web_password"] = config_data.get("web_password", "admin")
+    return config_data
+
+@app.post("/api/config")
+async def save_config(new_config: dict, token: str = Depends(verify_token)):
+    config_path = "config.yaml"
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(new_config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        try: reload_all_configs()
+        except Exception: pass
+        return {"status": "success", "message": "✅ 配置已成功保存！"}
+    except Exception as e:
+        return {"status": "error", "message": f"❌ 保存失败: {str(e)}"}
+
+@app.post("/api/config/generate_subdomains")
+async def generate_subdomains_api(req: GenerateSubReq, token: str = Depends(verify_token)):
+    try:
+        main_list = [d.strip() for d in req.main_domains.split(",") if d.strip()]
+        if not main_list:
+            return {"status": "error", "message": "请先在界面上方填写主域名池！"}
+
+        generated = []
+        for main_dom in main_list:
+            for _ in range(req.count):
+                prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+                generated.append(f"{prefix}.{main_dom}")
                 
-            if valid_count < MIN_ACCOUNTS_THRESHOLD:
-                need_to_reg = BATCH_REG_COUNT
-                success_in_this_cycle = 0
-                print(f"[{ts()}] [INFO] 侦测到库存不足 (当前 {valid_count} < {MIN_ACCOUNTS_THRESHOLD})，启动注册补货...")
-                await asyncio.sleep(1)
-                def cpa_safe_reg_worker():
-                    if _clash_enable and _clash_pool_mode:
-                        p = PROXY_QUEUE.get() 
-                        try:
-                            return run_and_refresh(p, args, cpa_upload=True, skip_switch=False) 
-                        finally:
-                            PROXY_QUEUE.put(p)
-                            PROXY_QUEUE.task_done()
-                    else:
-                        return run_and_refresh(args.proxy, args, cpa_upload=True, skip_switch=True)
-                while success_in_this_cycle < need_to_reg:
-                    remaining_gap = need_to_reg - success_in_this_cycle
-                    current_batch_size = min(REG_THREADS, remaining_gap)
-                    if _clash_enable and not _clash_pool_mode:
-                        print(f"[{ts()}] [INFO] [CPA补货] 触发单端口共享模式，正在为本批次并发切换全局节点...")
-                        if not smart_switch_node(args.proxy):
-                            print(f"[{ts()}] [WARNING] [CPA补货] 全局节点切换失败，将使用当前 IP 继续尝试...")
-
-                    if ENABLE_MULTI_THREAD_REG:
-                        print(f"[{ts()}] [INFO] 启动多线程并发补货: {success_in_this_cycle}/{need_to_reg} (启动 {current_batch_size} 线程)")
-                        with ThreadPoolExecutor(max_workers=current_batch_size) as executor:
-                            reg_futures = []
-                            for _ in range(current_batch_size):
-                                reg_futures.append(loop.run_in_executor(executor, cpa_safe_reg_worker))
-                                
-                            reg_results = await asyncio.gather(*reg_futures)
-                            
-                        for status in reg_results:
-                            if status == "success":
-                                success_in_this_cycle += 1
-                            elif status == "retry_403":
-                                print(f"[{ts()}] [WARNING] 遇到 403 频率限制，给服务器 15 秒冷却时间...")
-                                await asyncio.sleep(15)
-                    else:
-                        print(f"[{ts()}] [INFO] 启动单线程串行补货目标数: {success_in_this_cycle}/{need_to_reg}")
-                        if _clash_enable and _clash_pool_mode:
-                            p = PROXY_QUEUE.get()
-                            try:
-                                status = await loop.run_in_executor(None, run_and_refresh, p, args, True, False)
-                            finally:
-                                PROXY_QUEUE.put(p)
-                                PROXY_QUEUE.task_done()
-                        else:
-                            status = await loop.run_in_executor(None, run_and_refresh, args.proxy, args, True, True)
-                            
-                        if status == "success":
-                            success_in_this_cycle += 1
-                        elif status == "retry_403":
-                            await asyncio.sleep(10)
-
-                        await asyncio.sleep(5)
-                print(f"[{ts()}] [SUCCESS] 本轮补货任务圆满完成！累计入库: {success_in_this_cycle} 个。")
-            else:
-                print(f"[{ts()}] [INFO] 仓库存量充足，无需补发。")
+        generated_str = ",".join(generated)
+        config_path = "config.yaml"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                c = yaml.safe_load(f) or {}
+        except Exception:
+            c = {}
             
-            print(f"[{ts()}] [INFO] 维护周期结束，{CHECK_INTERVAL_MINUTES} 分钟后进行下一次巡检...")
-            await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+        c["sub_domains_list"] = generated_str
+        c["sub_domain_count"] = req.count
+        c["cf_api_email"] = req.api_email
+        c["cf_api_key"] = req.api_key
+        c["enable_sub_domains"] = True
+        
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(c, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] 主循环异常: {e}")
-            await asyncio.sleep(60)
+        try: reload_all_configs()
+        except Exception: pass
 
-def run_and_refresh(proxy, args, cpa_upload=False, skip_switch=False):
-    """包装层：执行前先切节点 -> 注册 -> 处理结果"""
-    if not skip_switch:
-        if not smart_switch_node(proxy):
-            print(f"[{ts()}] [WARNING] {proxy} 节点切换失败，将使用当前 IP 继续尝试...")
-    result = run(proxy)
-    status = handle_registration_result(result, cpa_upload=cpa_upload)
-    return status
+        return {
+            "status": "success", 
+            "domains": generated_str, 
+            "message": f"成功生成 {len(generated)} 个域名，并已自动保存至系统！"
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"执行异常: {str(e)}"}
 
-def normal_main_loop(args):
-    """常规模式 (纯量产注册，存本地)"""
-    sleep_min = max(1, NORMAL_SLEEP_MIN)
-    sleep_max = max(sleep_min, NORMAL_SLEEP_MAX)
-    target_count = NORMAL_TARGET_COUNT
+@app.post("/api/config/sync_cf_domains")
+async def sync_cf_domains_api(req: CFSyncExistingReq, token: str = Depends(verify_token)):
+    try:
+        sub_list = [d.strip() for d in req.sub_domains.split(",") if d.strip()]
+        if not sub_list:
+            return {"status": "error", "message": "没有需要同步的域名"}
 
-    print(f"\n[{ts()}] >>> 启动常规量产模式 <<<")
-    if target_count > 0:
-        print(f"[{ts()}] 任务目标: 注册 {target_count} 个账号后自动停止")
-    else:
-        print(f"[{ts()}] 任务目标: 无限挂机注册 (按 Ctrl+C 停止)")
+        cf_cfg = getattr(core_engine.cfg, '_c', {})
+        configured_main_domains = [d.strip() for d in cf_cfg.get("mail_domains", "").split(",") if d.strip()]
+        cf = Cloudflare(api_email=req.api_email, api_key=req.api_key)
 
-    success_count = 0
-    total_attempts = 0
+        main_domains_map = {}
+        for sub in sub_list:
+            for main in configured_main_domains:
+                if sub.endswith(main):
+                    main_domains_map.setdefault(main, []).append(sub)
+                    break
 
-    while True:
-        if target_count > 0 and success_count >= target_count:
-            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
-            break
+        def create_dns_record(zone_id, name):
+            try:
+                cf.email_routing.dns.create(zone_id=zone_id, name=name)
+            except Exception:
+                pass 
 
-        total_attempts += 1
-        print(f"\n[{ts()}] --- 开始发起第 {total_attempts} 次注册请求 (当前已成功: {success_count}) ---")
-        time.sleep(1)
+            dispatch_email_backend_add(name, cf_cfg)
+            return True
 
-        try:
-            if _clash_enable and not _clash_pool_mode:
-                print(f"[{ts()}] [INFO] 触发单端口共享模式，正在进行全局节点切换...")
-                if not smart_switch_node(args.proxy):
-                    print(f"[{ts()}] [WARNING] 全局节点切换失败，将使用当前 IP 继续尝试...")
+        all_tasks = []
+        for main_dom, subs in main_domains_map.items():
+            zones = await asyncio.to_thread(cf.zones.list, name=main_dom)
+            if not zones.result: continue
+            zone_id = zones.result[0].id
+            
+            for full_sub in subs:
+                all_tasks.append(asyncio.to_thread(create_dns_record, zone_id, full_sub))
 
-            if ENABLE_MULTI_THREAD_REG:
-                current_batch_size = min(REG_THREADS, target_count - success_count) if target_count > 0 else REG_THREADS
-                print(f"[{ts()}] [INFO] 启用 多线程并发... (分配 {current_batch_size} 条独立通道)")
+        success_count = 0
+        if all_tasks:
+            results = await asyncio.gather(*all_tasks)
+            success_count = sum(1 for r in results if r)
+        
+        return {
+            "status": "success", 
+            "message": f"🚀 同步完成！成功处理了 {success_count} 个域名的路由与后端下发。"
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"执行异常: {str(e)}"}
+        
+@app.get("/api/config/cf_global_status")
+async def get_cf_global_status(main_domain: str, token: str = Depends(verify_token)):
+    try:
+        cf_cfg = getattr(core_engine.cfg, '_c', {})
+        api_email = cf_cfg.get("cf_api_email")
+        api_key = cf_cfg.get("cf_api_key")
 
-                def thread_worker_wrapper():
-                    if _clash_enable and _clash_pool_mode:
-                        selected_proxy = PROXY_QUEUE.get()
-                        try:
-                            return run_and_refresh(selected_proxy, args, False, skip_switch=False)
-                        finally:
-                            PROXY_QUEUE.put(selected_proxy)
-                            PROXY_QUEUE.task_done()
-                    else:
-                        return run_and_refresh(args.proxy, args, False, skip_switch=True)
+        if not api_email or not api_key:
+            return {"status": "error", "message": "未配置 CF 账号信息"}
 
-                with ThreadPoolExecutor(max_workers=current_batch_size) as executor:
-                    futures = []
-                    for _ in range(current_batch_size):
-                        futures.append(executor.submit(thread_worker_wrapper))
+        cf = Cloudflare(api_email=api_email, api_key=api_key)
+        domains = [d.strip() for d in main_domain.split(",") if d.strip()]
+        results = []
+
+        for dom in domains:
+            zones = cf.zones.list(name=dom)
+            if not zones.result:
+                results.append({"domain": dom, "is_enabled": False, "dns_status": "not_found"})
+                continue
+            zone_id = zones.result[0].id
+
+            routing_info = cf.email_routing.get(zone_id=zone_id)
+            def safe_get(obj, attr, default=None):
+                val = getattr(obj, attr, None)
+                if val is None and hasattr(obj, 'result'):
+                    val = getattr(obj.result, attr, None)
+                return val if val is not None else default
+            raw_status = safe_get(routing_info, 'status', 'unknown')
+            raw_synced = safe_get(routing_info, 'synced', False)
+
+            is_enabled = (raw_status == 'ready' and raw_synced is True)
+            
+            dns_ui_status = "active" if raw_synced else "pending"
+
+            results.append({
+                "domain": dom,
+                "is_enabled": is_enabled,
+                "dns_status": dns_ui_status
+            })
+
+        return {"status": "success", "data": results}
+    except Exception as e:
+        return {"status": "error", "message": f"状态同步失败: {str(e)}"}
+
+@app.post("/api/config/delete_cf_domains")
+async def delete_cf_domains_api(req: CFDeleteExistingReq, token: str = Depends(verify_token)):
+    try:
+        sub_list = [d.strip() for d in req.sub_domains.split(",") if d.strip()]
+        if not sub_list:
+            return {"status": "error", "message": "没有需要删除的域名"}
+
+        cf_cfg = getattr(core_engine.cfg, '_c', {})
+        configured_main_domains = [d.strip() for d in cf_cfg.get("mail_domains", "").split(",") if d.strip()]
+        cf = Cloudflare(api_email=req.api_email, api_key=req.api_key)
+
+        main_domains_map = {}
+        for sub in sub_list:
+            for main in configured_main_domains:
+                if sub.endswith(main):
+                    main_domains_map.setdefault(main, []).append(sub)
+                    break
+
+        def do_delete(zone_id, full_sub):
+            try:
+                url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/email/routing/dns"
+                headers = {
+                    "X-Auth-Email": req.api_email,
+                    "X-Auth-Key": req.api_key,
+                    "Content-Type": "application/json"
+                }
+                payload = json.dumps({"name": full_sub}).encode('utf-8')
+                request = urllib.request.Request(url, data=payload, headers=headers, method="DELETE")
+                urllib.request.urlopen(request, timeout=10)
+                dispatch_email_backend_delete(full_sub, cf_cfg)
+                return full_sub 
+            except:
+                return None
+
+        all_tasks = []
+        for main_dom, subs in main_domains_map.items():
+            zones = await asyncio.to_thread(cf.zones.list, name=main_dom)
+            if not zones.result: continue
+            zone_id = zones.result[0].id
+            
+            for full_sub in subs:
+                all_tasks.append(asyncio.to_thread(do_delete, zone_id, full_sub))
+
+        success_list = []
+        if all_tasks:
+            results = await asyncio.gather(*all_tasks)
+            success_list = [r for r in results if r]
+        
+        if success_list:
+            config_path = "config.yaml"
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    c = yaml.safe_load(f) or {}
+                
+                existing_str = c.get("sub_domains_list", "")
+                if existing_str:
+                    existing_list = [d.strip() for d in existing_str.split(",") if d.strip()]
+                    new_list = [d for d in existing_list if d not in success_list]
+                    c["sub_domains_list"] = ",".join(new_list)
                     
-                    for future in futures:
-                        if future.result() == "success":
-                            success_count += 1
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        yaml.dump(c, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                    try: reload_all_configs()
+                    except: pass
+            except: pass
+
+        return {
+            "status": "success", 
+            "message": f"🚀 清理完成！成功从全端卸载了 {len(success_list)} 个路由记录。"
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"执行异常: {str(e)}"}
+        
+@app.get("/api/accounts")
+async def get_accounts(page: int = Query(1), page_size: int = Query(50), token: str = Depends(verify_token)):
+    result = db_manager.get_accounts_page(page, page_size)
+    return {
+        "status": "success", 
+        "data": result["data"],
+        "total": result["total"],
+        "page": page,
+        "page_size": page_size
+    }
+
+@app.post("/api/account/action")
+async def account_action(data: dict, token: str = Depends(verify_token)):
+    email = data.get("email")
+    action = data.get("action")
+    config = getattr(core_engine.cfg, '_c', {})
+    
+    token_data = db_manager.get_token_by_email(email)
+    if not token_data:
+        return {"status": "error", "message": f"未找到 {email} 的 Token。"}
+
+    if action == "push":
+        if not config.get("cpa_mode", {}).get("enable", False):
+            return {"status": "error", "message": "🚫 推送失败：未开启 CPA 模式！"}
+        
+        success, msg = core_engine.upload_to_cpa_integrated(
+            token_data, 
+            config.get("cpa_mode", {}).get("api_url", ""), 
+            config.get("cpa_mode", {}).get("api_token", "")
+        )
+        if success:
+            return {"status": "success", "message": f"账号 {email} 已成功推送到 CPA！"}
+        return {"status": "error", "message": f"CPA 推送失败: {msg}"}
+
+    elif action == "push_sub2api":
+        if not getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False):
+            return {"status": "error", "message": "🚫 推送失败：未开启 Sub2API 模式！"}
+            
+        client = Sub2APIClient(api_url=core_engine.cfg.SUB2API_URL, 
+                               api_key=core_engine.cfg.SUB2API_KEY)
+        
+        success, resp = client.add_account(token_data)
+        if success:
+            return {"status": "success", "message": f"账号 {email} 已同步至 Sub2API！"}
+        return {"status": "error", "message": f"Sub2API 推送失败: {resp}"}
+            
+@app.post("/api/config/query_cf_domains")
+async def query_cf_domains_api(req: CFQueryReq, token: str = Depends(verify_token)):
+    try:
+        main_list = [d.strip() for d in req.main_domains.split(",") if d.strip()]
+        if not main_list:
+            return {"status": "error", "message": "请先填写主域名池！"}
+
+        cf = Cloudflare(api_email=req.api_email, api_key=req.api_key)
+        found_subdomains = set()
+        errors = []
+
+        for main_dom in main_list:
+            try:
+                zones = cf.zones.list(name=main_dom)
+                if not zones.result:
+                    errors.append(f"找不到 {main_dom} 的 Zone ID")
+                    continue
+                zone_id = zones.result[0].id
+
+                dns_records = cf.dns.records.list(zone_id=zone_id, type="MX")
+
+                for record in dns_records:
+                    if "cloudflare.net" in str(record.content).lower():
+                        if record.name != main_dom:
+                            found_subdomains.add(record.name)
+                            
+            except Exception as e:
+                errors.append(f"查询 {main_dom} 时异常: {str(e)}")
+
+        if not found_subdomains and errors:
+            return {"status": "error", "message": f"查询失败: {errors[0]}"}
+
+        result_list = list(found_subdomains)
+        
+        return {
+            "status": "success", 
+            "domains": ",".join(result_list), 
+            "message": f"成功从 CF 线上拉取到 {len(result_list)} 个已配置邮件路由的子域名！"
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"执行异常: {str(e)}"}
+
+@app.post("/api/logs/clear")
+async def clear_backend_logs(token: str = Depends(verify_token)):
+    """清空后端的历史日志缓存"""
+    log_history.clear()
+    return {"status": "success"}
+
+@app.websocket("/ws/logs")
+async def websocket_logs(websocket: WebSocket, token: str = Query(None)):
+    if token not in VALID_TOKENS:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    for old_msg in log_history:
+        await websocket.send_text(old_msg)
+    try:
+        while True:
+            if not core_engine.log_queue.empty():
+                msg = core_engine.log_queue.get_nowait()
+                log_history.append(msg)
+                await websocket.send_text(msg)
             else:
-                if _clash_enable and _clash_pool_mode:
-                    selected_proxy = PROXY_QUEUE.get()
-                    try:
-                        status = run_and_refresh(selected_proxy, args, False, skip_switch=False)
-                    finally:
-                        PROXY_QUEUE.put(selected_proxy)
-                        PROXY_QUEUE.task_done()
-                else:
+                await asyncio.sleep(0.1)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
-                    status = run_and_refresh(args.proxy, args, False, skip_switch=True)
-
-                if status == "success":
-                    success_count += 1
-
-        except Exception as e:
-            print(f"[{ts()}] [ERROR] 发生未捕获全局异常: {e}")
-
-        if target_count > 0 and success_count >= target_count:
-            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
-            break
-
-        if args.once:
-            break
-
-        wait_time = random.randint(sleep_min, sleep_max)
-        print(f"[{ts()}] [INFO] 缓冲防风控，等待 {wait_time} 秒后继续...")
-        time.sleep(wait_time)
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="OpenAI 自动注册 & CPA 检测一体")
-    parser.add_argument("--proxy", default=None, help="代理地址，如 http://127.0.0.1:7890")
-    parser.add_argument("--once", action="store_true", help="只运行一次 (常规模式下有效)")
-    # parser.add_argument("--sleep-min", type=int, default=5, help="循环模式最短等待秒数")
-    # parser.add_argument("--sleep-max", type=int, default=30, help="循环模式最长等待秒数")
-    args = parser.parse_args()
-    args.proxy = DEFAULT_PROXY if DEFAULT_PROXY.strip() else None
-    print("=" * 65)
-    print("   OpenAI 无限注册 & CPA 智能仓管")
-    print("   Author: (wenfxl)轩灵")
-    print("   特性1: 支持纯协议无限注册、周限额低于设定值自动挂起/剔除")
-    print("   特性2: CPA里凭证失效后自动抢救，周限额恢复后自动唤醒")
-    print("   特性3: 全局支持测活、注册双重多线程控制")
-    print("-" * 65)
-    if ENABLE_CPA_MODE:
-        print("   当前状态: [ CPA 智能仓管模式 ] 已开启")
-        print("   行为逻辑: 自动巡检测活 -> 智能挂起/剔除死号 -> 补货注册 -> 云端上传")
-    else:
-        print("   当前状态: [ 常规量产模式 ] 已开启")
-        print("   行为逻辑: 纯净无限注册 -> 本地保存 (CPA 上传已关闭)")
-    print("=" * 65)
-
-    if ENABLE_CPA_MODE:
-        try:
-            asyncio.run(cpa_main_loop(args))
-        except KeyboardInterrupt:
-            print(f"\n[{ts()}] [INFO] 用户终止了系统运行。")
-    else:
-        try:
-            normal_main_loop(args)
-        except KeyboardInterrupt:
-            print(f"\n[{ts()}] [INFO] 用户终止了系统运行。")
+@app.get("/")
+async def get_dashboard():
+    html_path = os.path.join(os.path.dirname(__file__), "index.html")
+    if not os.path.exists(html_path):
+        return HTMLResponse(content="<h1>找不到 index.html</h1>", status_code=404)
+    with open(html_path, "r", encoding="utf-8") as f:
+        return HTMLResponse(content=f.read())
 
 if __name__ == "__main__":
-    main()
+    try: reload_all_configs()
+    except: pass
+    print("=" * 65)
+    print(f"[{core_engine.ts()}] [系统] OpenAI 无限注册 & CPA 智能仓管")
+    print(f"[{core_engine.ts()}] [系统] Author: (wenfxl)轩灵")
+    print(f"[{core_engine.ts()}] [系统] 如果遇到问题请更换域名解决，目前eu.cc，xyz，cn，edu.cc等常见域名均不可用，请更换为冷门域名")
+    print("-" * 65)
+    print(f"[{core_engine.ts()}] [系统] Web 控制台已准备就绪，等待下发指令...")
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

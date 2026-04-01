@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wenfxl 注册管理系统</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+	<script src="/static/js/tailwind.min.js"></script>
+    <script src="/static/js/vue.global.js"></script>
+</head>
+<body class="overflow-hidden">
+    <div id="app" v-cloak class="h-screen flex flex-col">
+        
+        <div class="fixed top-6 right-6 z-[9999] flex flex-col gap-3">
+            <transition-group name="toast">
+                <div v-for="toast in toasts" :key="toast.id"
+                     class="px-5 py-3 rounded-lg shadow-xl text-sm font-bold text-white flex items-center justify-between min-w-[250px] border transform"
+                     :class="{
+                         'bg-green-600 border-green-700': toast.type === 'success',
+                         'bg-red-600 border-red-700': toast.type === 'error',
+                         'bg-blue-600 border-blue-700': toast.type === 'info',
+                         'bg-yellow-500 border-yellow-600 text-yellow-900': toast.type === 'warning'
+                     }">
+                     <div class="flex items-center gap-2">
+                        <span v-if="toast.type === 'success'">✅</span>
+                        <span v-else-if="toast.type === 'error'">❌</span>
+                        <span v-else-if="toast.type === 'warning'">⚠️</span>
+                        <span v-else>ℹ️</span>
+                        <span>{{ toast.message }}</span>
+                     </div>
+                </div>
+            </transition-group>
+        </div>
+
+        <div v-if="confirmModal.show" class="fixed inset-0 z-[10000] flex items-center justify-center bg-gray-900/60 backdrop-blur-sm transition-opacity">
+            <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-md mx-4 transform transition-all scale-100">
+                <h3 class="text-xl font-bold text-gray-800 mb-3 flex items-center gap-2">
+                    <span>🤔</span> 系统确认
+                </h3>
+                <p class="text-gray-600 mb-6 leading-relaxed">{{ confirmModal.message }}</p>
+                <div class="flex justify-end gap-3">
+                    <button @click="handleConfirm(false)" class="px-5 py-2 rounded-lg font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 transition">取消</button>
+                    <button @click="handleConfirm(true)" class="px-5 py-2 rounded-lg font-medium text-white bg-blue-600 hover:bg-blue-700 shadow-md transition">确认执行</button>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="!isLoggedIn" class="min-h-screen flex items-center justify-center bg-gray-100 relative overflow-hidden">
+            <div class="absolute inset-0 bg-gradient-to-br from-blue-50 to-indigo-100 z-0"></div>
+            <div class="bg-white p-8 rounded-2xl shadow-2xl w-120 z-10 border border-gray-100">
+                <div class="text-center mb-8">
+                    <h2 class="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600">Wenfxl Codex Manager</h2>
+                    <p class="text-sm text-gray-500 mt-2">安全级控制台登录</p>
+                </div>
+                <div class="mb-6 relative">
+                    <label class="block text-gray-700 text-sm font-bold mb-2">访问密码</label>
+                    <div class="relative">
+                        <input :type="showPwd.login ? 'text' : 'password'" v-model="loginPassword" @keyup.enter="handleLogin" class="shadow-sm appearance-none border border-gray-300 rounded-lg w-full py-3 px-4 pr-10 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition" placeholder="请输入系统密码">
+                        <button @click="showPwd.login = !showPwd.login" class="absolute right-3 top-1/2 -translate-y-1/2 text-xl text-gray-400 hover:text-blue-500 focus:outline-none transition-transform hover:scale-110">
+                            {{ showPwd.login ? '👁️' : '🙈' }}
+                        </button>
+                    </div>
+                </div>
+                <button @click="handleLogin" class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-bold py-3 px-4 rounded-lg focus:outline-none focus:shadow-outline shadow-lg transform hover:-translate-y-0.5 transition">
+                    安全登录
+                </button>
+            </div>
+        </div>
+
+        <div v-else class="flex flex-1 overflow-hidden bg-gray-50">
+            <aside class="w-56 bg-gray-900 text-white flex flex-col shadow-xl z-20">
+                <div class="p-5 flex items-center justify-center border-b border-gray-800">
+                    <span class="font-black text-lg tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-400">Wenfxl Manager</span>
+                </div>
+                <nav class="flex-1 px-3 py-4 space-y-1.5 overflow-y-auto">
+                    <button v-for="tab in tabs" :key="tab.id" @click="currentTab = tab.id"
+                            :class="['w-full flex items-center gap-3 px-4 py-3 text-sm font-medium rounded-lg transition-all', 
+                                     currentTab === tab.id ? 'bg-blue-600 text-white shadow-md' : 'text-gray-400 hover:bg-gray-800 hover:text-gray-100']">
+                        <span>{{ tab.icon }}</span>
+                        {{ tab.name }}
+                    </button>
+                </nav>
+                <div class="p-4 border-t border-gray-800">
+                    <button @click="logout" class="w-full flex items-center justify-center gap-2 text-sm text-gray-400 hover:text-red-400 py-2 rounded hover:bg-gray-800 transition">
+                        <span>🚪</span> 退出登录
+                    </button>
+                </div>
+            </aside>
+
+            <main class="flex-1 flex flex-col min-w-0 overflow-hidden relative">
+                <header class="bg-[#0f172a] text-white p-4 shrink-0 shadow-lg z-10 border-b border-gray-800">
+                    <div class="max-w-[80%] mx-auto flex items-center justify-between">
+                        <div class="flex items-center gap-4 flex-1">
+                            <div class="bg-[#0f3d35] text-[#4ade80] px-3 py-1.5 rounded-md text-sm font-bold tracking-wide border border-[#166534]">
+                                模式: {{ stats.mode }} · 成功 {{stats.success}}/{{stats.target}} · 总 {{stats.total}}
+                            </div>
+                            <div class="text-[#38bdf8] font-bold text-sm ml-2">{{stats.progress_pct}}</div>
+                            <div class="w-64 h-2.5 bg-gray-700 rounded-full overflow-hidden">
+                                <div class="h-full bg-[#38bdf8] progress-bar-inner shadow-[0_0_10px_#38bdf8]" :style="{ width: stats.progress_pct }"></div>
+                            </div>
+                        </div>
+
+                        <div class="flex items-center gap-4">
+                            <span v-if="isRunning" class="flex items-center gap-2 text-green-400 text-sm font-bold bg-green-900/30 px-3 py-1 rounded-full border border-green-800">
+                                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span> 引擎运行中
+                            </span>
+                            <span v-else class="flex items-center gap-2 text-gray-400 text-sm font-bold bg-gray-800 px-3 py-1 rounded-full border border-gray-700">
+                                <span class="w-2 h-2 bg-gray-500 rounded-full"></span> 引擎已停止
+                            </span>
+
+                            <button @click="toggleSystem" 
+                                    class="px-6 py-2 rounded-lg font-black text-white shadow-lg transition transform hover:scale-105"
+                                    :class="isRunning ? 'bg-red-600 hover:bg-red-500 shadow-red-500/30' : 'bg-blue-600 hover:bg-blue-500 shadow-blue-500/30'">
+                                {{ isRunning ? '⏹️ 紧急停止' : '🚀 智能一键启动' }}
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="max-w-[80%] mx-auto mt-3 text-[13px] text-gray-400 font-mono tracking-wide">
+                        成功率 {{stats.success_rate}} · 成功 {{stats.success}}/{{stats.target}} · 失败 {{stats.failed}} 次 · 风控拦截 {{stats.retries}} 次 · 总耗时 {{stats.elapsed}} · 平均 {{stats.avg_time}}
+                    </div>
+                </header>
+
+                <div class="flex-1 overflow-y-auto p-6 bg-gray-100 relative">
+                    <div class="max-w-[80%] mx-auto">
+                        
+                        <button v-show="['email', 'proxy', 'relay', 'concurrency'].includes(currentTab)" @click="saveConfig" 
+                                class="fixed bottom-8 right-8 z-50 px-6 py-3 bg-indigo-600 text-white font-extrabold rounded-full shadow-2xl hover:bg-indigo-700 transition transform hover:-translate-y-1 flex items-center gap-2 ring-4 ring-indigo-600/30">
+                            <span>💾</span> 保存并热重载配置
+                        </button>
+
+                        <div v-show="currentTab === 'console'" class="h-full flex flex-col">
+                            <div class="flex justify-between items-end mb-3">
+                                <h2 class="text-xl font-extrabold text-gray-800">实时运行日志</h2>
+                                <button @click="clearLogs" class="text-sm bg-gray-200 text-gray-700 px-4 py-1.5 rounded-lg hover:bg-gray-300 transition font-bold shadow-sm flex items-center gap-2">
+                                    <span>🧹</span> 清屏
+                                </button>
+                            </div>
+                            <div class="bg-[#0d1117] rounded-xl shadow-2xl relative overflow-hidden border border-gray-800 flex flex-col h-[calc(100vh-260px)] min-h-[400px]">
+                                <div class="w-full h-10 bg-[#161b22] flex items-center px-4 gap-2 border-b border-gray-800 shrink-0">
+                                    <div class="flex gap-1.5">
+                                        <div class="w-3 h-3 rounded-full bg-[#ff5f56] border border-[#e0443e]"></div>
+                                        <div class="w-3 h-3 rounded-full bg-[#ffbd2e] border border-[#dea123]"></div>
+                                        <div class="w-3 h-3 rounded-full bg-[#27c93f] border border-[#1aab29]"></div>
+                                    </div>
+                                    <div class="flex-1 text-center flex justify-center items-center gap-2">
+                                        <span class="w-2 h-2 rounded-full animate-pulse" :class="isRunning ? 'bg-green-500' : 'bg-gray-500'"></span>
+                                        <span class="text-xs text-gray-400 font-mono">wfxl-openai-terminal ~ bash</span>
+                                    </div>
+                                    <div class="w-10"></div> </div>
+                                
+                                <div class="flex-1 overflow-y-auto p-3 text-[13px] font-mono leading-relaxed" id="terminal-container" style="scroll-behavior: smooth;">
+                                    
+                                    <div v-if="logs.length === 0" class="h-full flex flex-col items-center justify-center text-gray-600 gap-3">
+                                        <div class="text-4xl">💻</div>
+                                        <div class="italic">系统待命，日志将在此打印...</div>
+                                    </div>
+
+                                    <div v-for="(log, index) in logs" :key="index" 
+                                         class="flex items-start gap-3 py-1 px-2 rounded hover:bg-white/5 transition-colors group">
+                                         
+                                        <template v-if="log.parsed">
+                                            <span class="text-gray-500 shrink-0 select-none">[{{ log.time }}]</span>
+                                            
+                                            <span class="shrink-0 w-[72px] text-center rounded text-[11px] font-black tracking-wider py-0.5 border"
+                                                  :class="{
+                                                      'bg-green-900/30 text-green-400 border-green-800': log.level === 'SUCCESS',
+                                                      'bg-red-900/30 text-red-400 border-red-800': log.level === 'ERROR',
+                                                      'bg-yellow-900/30 text-yellow-400 border-yellow-800': log.level === 'WARNING',
+                                                      'bg-blue-900/30 text-blue-400 border-blue-800': log.level === 'INFO' || log.level === '系统',
+                                                      'bg-gray-800 text-gray-300 border-gray-700': !['SUCCESS','ERROR','WARNING','INFO','系统'].includes(log.level)
+                                                  }">
+                                                {{ log.level }}
+                                            </span>
+                                            
+											<span class="flex-1 break-all"
+                                                  :class="{
+                                                      'text-[#4ade80]': log.level === 'SUCCESS',
+                                                      'text-[#ff5f56] font-bold': log.level === 'ERROR',
+                                                      'text-[#ffbd2e]': log.level === 'WARNING',
+                                                      'text-gray-300': !['SUCCESS','ERROR','WARNING'].includes(log.level)
+                                                  }">
+                                                {{ log.text }}
+                                            </span>
+                                        </template>
+                                        
+                                        <template v-else>
+                                            <span class="text-gray-400 whitespace-pre-wrap break-all">{{ log.raw }}</span>
+                                        </template>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div v-show="currentTab === 'accounts'" class="bg-white rounded-xl shadow-md overflow-hidden border border-gray-100">
+                            <div class="px-6 py-5 border-b border-gray-200 flex justify-between items-center bg-gray-50/50">
+                                <div>
+                                    <h2 class="text-xl font-extrabold text-gray-800">本地账号库</h2>
+                                </div>
+                                <div class="flex flex-wrap gap-3 justify-end items-center">
+									<span>已选 ({{ selectedAccounts.length }})</span> 
+									<button @click="showAccountsPlaintext = !showAccountsPlaintext" class="text-sm bg-gray-200 text-gray-700 px-4 py-2 rounded-lg hover:bg-gray-300 transition shadow-sm font-bold flex items-center gap-2">
+										<span>{{ showAccountsPlaintext ? '🙈' : '👁️' }}</span> {{ showAccountsPlaintext ? '脱敏' : '明文' }}
+									</button>
+									<button @click="exportSelectedAccounts" :disabled="selectedAccounts.length === 0" class="text-sm bg-blue-600 text-white px-5 py-2 rounded-lg hover:bg-blue-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+										<span>📥</span> 导出tokens
+									</button>
+									<button @click="exportAccountsToTxt" :disabled="selectedAccounts.length === 0" class="text-sm bg-teal-600 text-white px-5 py-2 rounded-lg hover:bg-teal-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+										<span>📄</span> 导出账密
+									</button>
+									<button @click="deleteSelectedAccounts" :disabled="selectedAccounts.length === 0" class="text-sm bg-red-600 text-white px-5 py-2 rounded-lg hover:bg-red-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+										<span>🗑️</span> 删除
+									</button>
+                                    <button @click="bulkPushCPA" :disabled="selectedAccounts.length === 0" class="text-sm bg-green-600 text-white px-5 py-2 rounded-lg hover:bg-green-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+                                        <span>🚀</span> 推 CPA
+                                    </button>
+									<button @click="bulkPushSub2API" :disabled="selectedAccounts.length === 0" class="text-sm bg-purple-600 text-white px-5 py-2 rounded-lg hover:bg-purple-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+										<span>🛸</span> 推 Sub2API
+									</button>
+                                    <button @click="fetchAccounts(true)" class="text-sm bg-white border border-gray-300 text-gray-700 px-5 py-2 rounded-lg hover:bg-gray-50 transition shadow-sm font-bold flex items-center gap-2"><span>🔄</span> 刷新列表</button>
+                                </div>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="min-w-full divide-y divide-gray-200">
+                                    <thead class="bg-gray-50">
+                                        <tr>
+                                            <th class="px-6 py-4 text-left w-12"><input type="checkbox" @change="toggleAll" :checked="selectedAccounts.length === accounts.length && accounts.length > 0" class="form-checkbox w-4 h-4 text-blue-600 rounded"></th>
+                                            <th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-16">#</th>
+                                            <th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">邮箱账号</th>
+                                            <th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">登录密码</th>
+                                            <th class="px-6 py-4 text-center text-xs font-bold text-gray-500 uppercase tracking-wider">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="bg-white divide-y divide-gray-100">
+                                        <tr v-if="accounts.length === 0">
+                                            <td colspan="5" class="px-6 py-12 text-center text-gray-400 font-medium">暂无本地记录</td>
+                                        </tr>
+                                        <tr v-for="(acc, index) in accounts" :key="index" class="hover:bg-blue-50/50 transition duration-150" :class="{'bg-blue-50/80': selectedAccounts.includes(acc)}">
+                                            <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" :value="acc" v-model="selectedAccounts" class="form-checkbox w-4 h-4 text-blue-600 rounded"></td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400 font-mono">{{ index + 1 }}</td>
+											<td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-700">
+												{{ showAccountsPlaintext ? acc.email : maskEmail(acc.email) }}
+											</td>
+											<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 font-mono bg-white rounded px-2 border">
+												{{ showAccountsPlaintext ? acc.password : '••••••••' }}
+											</td>
+                                            <td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
+                                                <button @click="triggerAccountAction(acc, 'push')" class="text-green-700 bg-green-100 hover:bg-green-200 px-3 py-1 rounded-md transition font-bold shadow-sm">推CPA</button>
+												<button @click="triggerAccountAction(acc, 'push_sub2api')" class="text-purple-700 bg-purple-100 hover:bg-purple-200 px-3 py-1 rounded-md transition font-bold shadow-sm">推 Sub2API</button>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+							<div class="px-6 py-4 border-t border-gray-200 bg-gray-50 flex items-center justify-between rounded-b-xl">
+								<div class="text-sm text-gray-500 font-bold">
+									共 <span class="text-blue-600 text-base">{{ totalAccounts }}</span> 个账号，当前第 <span class="text-gray-800">{{ currentPage }}</span> / {{ totalPages }} 页
+									<select v-model.number="pageSize" @change="changePageSize" class="bg-white border border-gray-300 text-gray-700 py-1 px-2 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition cursor-pointer">
+										<option :value="10">10 条 / 页</option>
+										<option :value="20">20 条 / 页</option>
+										<option :value="50">50 条 / 页</option>
+										<option :value="100">100 条 / 页</option>
+										<option :value="200">200 条 / 页</option>
+										<option :value="500">500 条 / 页</option>
+									</select>
+								</div>
+								<div class="flex gap-2">
+									<button @click="changePage(currentPage - 1)" :disabled="currentPage <= 1" class="px-4 py-2 rounded-lg text-sm font-bold bg-white border border-gray-300 text-gray-700 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition">
+										上一页
+									</button>
+									<button @click="changePage(currentPage + 1)" :disabled="currentPage >= totalPages" class="px-4 py-2 rounded-lg text-sm font-bold bg-white border border-gray-300 text-gray-700 hover:bg-gray-100 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm transition">
+										下一页
+									</button>
+								</div>
+							</div>
+                        </div>
+
+						<div v-show="currentTab === 'cf_routes'" class="bg-white rounded-xl shadow-md overflow-hidden border border-gray-100 flex flex-col h-[calc(100vh-160px)]">
+							<div class="px-6 py-5 border-b border-gray-200 bg-gray-50/50">
+								<div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+									<div>
+										<h2 class="text-xl font-extrabold text-gray-800 flex items-center gap-2"><span>🌍</span> CF 线上路由管仓</h2>
+										<div class="flex flex-wrap gap-2">
+											<div v-for="st in cfGlobalStatusList" :key="st.domain" 
+												 class="flex items-center gap-2 px-2 py-1 rounded-md text-[10px] font-bold border transition-all"
+												 :class="st.is_enabled ? 'bg-green-50 text-green-600 border-green-200' : 'bg-red-50 text-red-600 border-red-200'"
+												 :title="st.domain">
+												<span class="w-1.5 h-1.5 rounded-full" :class="st.is_enabled ? 'bg-green-500 animate-pulse' : 'bg-red-500'"></span>
+												{{ st.domain.split('.')[0] }}: {{ st.is_enabled ? '已启用' : '正在同步' }}
+											</div>
+										</div>
+									</div>
+									<div class="flex flex-wrap gap-3 justify-end items-center">
+										<span v-if="selectedCfRoutes && selectedCfRoutes.length > 0" class="text-sm font-bold text-blue-600">已勾选 ({{ selectedCfRoutes.length }})</span>
+										<button @click="deleteSelectedCfRoutes" :disabled="!selectedCfRoutes || selectedCfRoutes.length === 0 || isDeletingCfRoutes" class="text-sm bg-red-600 text-white px-5 py-2 rounded-lg hover:bg-red-700 transition shadow-md disabled:opacity-50 font-bold flex items-center gap-2">
+											<span v-if="isDeletingCfRoutes" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+											<span v-else>🗑️</span>
+											{{ isDeletingCfRoutes ? '正在销毁...' : '批量删除记录' }}
+										</button>
+										<button @click="fetchCfRoutes" class="text-sm bg-blue-600 text-white px-5 py-2 rounded-lg hover:bg-blue-700 transition shadow-md font-bold flex items-center gap-2" :disabled="isLoadingCfRoutes">
+											<span :class="{'animate-spin inline-block': isLoadingCfRoutes}">🔄</span> {{ isLoadingCfRoutes ? '正在拉取...' : '同步线上记录' }}
+										</button>
+									</div>
+								</div>
+							</div>
+
+							<div class="flex-1 overflow-y-auto">
+								<table class="min-w-full divide-y divide-gray-200">
+									<thead class="bg-gray-50 sticky top-0 z-10">
+										<tr>
+											<th class="px-6 py-4 text-left w-12">
+												<input type="checkbox" @change="toggleAllCfRoutes" :checked="cfRoutes && selectedCfRoutes && selectedCfRoutes.length === cfRoutes.length && cfRoutes.length > 0" class="form-checkbox w-4 h-4 text-blue-600 rounded">
+											</th>
+											<th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-16">#</th>
+											<th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">在线二级域名 (Email Routing)</th>
+											<th class="px-6 py-4 text-center text-xs font-bold text-gray-500 uppercase tracking-wider w-32">操作</th>
+										</tr>
+									</thead>
+									<tbody class="bg-white divide-y divide-gray-100">
+										<tr v-if="!cfRoutes || cfRoutes.length === 0">
+											<td colspan="4" class="px-6 py-16 text-center text-gray-400 font-medium">暂无数据，请点击右上角「同步线上记录」</td>
+										</tr>
+										<tr v-for="(route, index) in cfRoutes" :key="route.domain" class="hover:bg-blue-50/50 transition duration-150" :class="{'bg-blue-50/80': selectedCfRoutes.includes(route)}">
+											<td class="px-6 py-4 whitespace-nowrap">
+												<input type="checkbox" :value="route" v-model="selectedCfRoutes" class="form-checkbox w-4 h-4 text-blue-600 rounded">
+											</td>
+											<td class="px-6 py-4 whitespace-nowrap text-sm text-gray-400 font-mono">{{ index + 1 }}</td>
+											<td class="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-700 font-mono text-blue-600">
+												{{ route.domain }}
+											</td>
+											<td class="px-6 py-4 whitespace-nowrap text-center text-sm font-medium">
+												<button @click="deleteSingleCfRoute(route)" :disabled="route.loading" class="text-red-700 bg-red-100 hover:bg-red-200 px-4 py-1.5 rounded-md transition font-bold shadow-sm flex items-center justify-center gap-1 mx-auto min-w-[100px]">
+													<span v-if="route.loading" class="w-3 h-3 border-2 border-red-700 border-t-transparent rounded-full animate-spin"></span>
+													<span v-else>🗑️</span>
+													{{ route.loading ? '处理中' : '单条销毁' }}
+												</button>
+											</td>
+										</tr>
+									</tbody>
+								</table>
+							</div>
+						</div>
+						
+                        <div v-show="currentTab === 'email'" v-if="config" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="config-card">
+                                <h3 class="config-title text-blue-600">📧 基础发信设置</h3>
+                                <label class="form-label mt-2">API 模式选择 (email_api_mode)</label>
+                                <select v-model="config.email_api_mode" @change="if(!['freemail', 'imap'].includes(config.email_api_mode)) config.enable_sub_domains = false;" class="form-input bg-gray-50 font-bold text-blue-700 shadow-sm cursor-pointer transition">
+                                    <option value="cloudflare_temp_email">cloudflare_temp_email (CF 临时邮箱)</option>
+                                    <option value="imap">imap (直连收件箱)</option>
+                                    <option value="freemail">freemail</option>
+                                    <option value="cloudmail">cloudmail</option>
+                                    <option value="mail_curl">mail_curl</option>
+									<option value="luckmail">luckmail (LuckMail 接码)</option>
+                                </select>
+
+                                <label class="form-label mt-4">发信域名池 (mail_domains)</label>
+                                <span class="form-hint">支持逗号分隔多域名随机轮换</span>
+                                <input type="text" v-model="config.mail_domains" class="form-input" placeholder="如 a.com,b.com">
+
+								<div class="mt-5 p-5 bg-blue-50/50 rounded-xl border border-blue-200 shadow-sm flex flex-col gap-4">
+									<div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+										<div>
+											<h4 class="text-sm font-bold text-blue-800">二级域名泛解析模式</h4>
+											<p class="text-xs text-gray-500 mt-1">开启后将忽略上方主域名池，使用下方生成的二级域名轮询。配置需点击右下角保存生效。</p>
+											<p v-if="!['freemail', 'imap'].includes(config.email_api_mode)" class="text-[11px] font-bold text-red-600 mt-2 bg-red-50 px-2.5 py-1.5 rounded-md inline-block border border-red-100 shadow-sm">
+												⚠️ 系统提示：当前发信 API 模式不支持此功能！仅允许在 freemail 或 imap 模式下开启。
+											</p>
+										</div>
+										<label class="relative inline-flex items-center shrink-0" :class="['freemail', 'imap'].includes(config.email_api_mode) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50 grayscale'">
+											<input type="checkbox" v-model="config.enable_sub_domains" :disabled="!['freemail', 'imap'].includes(config.email_api_mode)" class="sr-only peer">
+											<div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" :class="!['freemail', 'imap'].includes(config.email_api_mode) ? 'peer-checked:bg-gray-400' : 'peer-checked:bg-blue-600'"></div>
+										</label>
+									</div>
+
+									<div v-if="config.enable_sub_domains" class="border-t border-blue-100 pt-4 space-y-4">
+										<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+											<div>
+												<label class="block text-xs font-bold text-gray-600 mb-1">CF 账号邮箱</label>
+												<input type="text" v-model="config.cf_api_email" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500" placeholder="邮箱">
+											</div>
+											<div>
+												<label class="block text-xs font-bold text-gray-600 mb-1">CF Global API Key</label>
+												<input type="password" v-model="config.cf_api_key" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500" placeholder="是CF API 密钥Global API Key，不要填成了API令牌">
+											</div>
+											<div>
+												<label class="block text-xs font-bold text-gray-600 mb-1">每个主域生成数量</label>
+												<input type="number" v-model.number="config.sub_domain_count" class="form-input bg-white mb-0 text-blue-600 font-bold border-gray-300 focus:ring-blue-500" placeholder="10">
+											</div>
+											<div>
+												<label class="block text-xs font-bold text-red-600 mb-1">域名失败几次执行自愈</label>
+												<input type="number" v-model.number="config.sub_domain_fail_threshold" class="form-input bg-white mb-0 text-red-600 font-bold border-red-200 focus:ring-red-500" placeholder="默认: 3">
+											</div>
+											<div>
+												<label class="block text-xs font-bold text-green-600 mb-1">单次更替补货数量</label>
+												<input type="number" v-model.number="config.sub_domain_refill_count" class="form-input bg-white mb-0 text-green-600 font-bold border-green-200 focus:ring-green-500" placeholder="默认: 1">
+											</div>
+										</div>
+
+										<div class="flex flex-wrap gap-3">
+											<button @click="executeGenerateDomainsOnly" class="px-5 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg shadow-md hover:bg-blue-700 transition flex items-center gap-2">
+												<span>🔄</span> 随机生成二级域名
+											</button>
+											<button @click="executeSyncToCF" 
+													class="px-5 py-2.5 bg-teal-600 text-white text-sm font-bold rounded-lg shadow-md hover:bg-teal-700 transition flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed" 
+													:disabled="!config.sub_domains_list || isLoadingSync">
+												<span :class="{'animate-spin inline-block': isLoadingSync}">{{ isLoadingSync ? '🔄' : '☁️' }}</span> 
+												{{ isLoadingSync ? '多线程同步中...' : '将当前列表推送至 CF' }}
+											</button>
+										</div>
+
+										<div v-if="config.sub_domains_list" class="mt-2 p-4 bg-white rounded-xl border border-gray-200">
+											<h4 class="text-xs font-bold text-gray-500 mb-3 flex items-center gap-2">
+												<span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+												已生成 / 即将生效的二级域名池 ({{ config.sub_domains_list.split(',').length }} 个)
+											</h4>
+											<div class="flex flex-wrap gap-2">
+												<div v-for="domain in config.sub_domains_list.split(',').filter(d=>d)" :key="domain" 
+													 class="px-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg flex items-center gap-2 shadow-sm">
+													<span class="text-blue-600 text-[12px] font-mono tracking-wide font-bold">{{ domain }}</span>
+													<span class="w-4 h-4 rounded-full bg-green-100 border border-green-300 text-green-600 flex items-center justify-center text-[9px] font-bold">R</span>
+												</div>
+											</div>
+										</div>
+									</div>
+								</div>
+								
+                                <label class="form-checkbox-label mt-5 p-3 bg-gray-50 rounded-lg border border-gray-100">
+                                    <input type="checkbox" v-model="config.use_proxy_for_email" class="form-checkbox mt-1 text-blue-600">
+                                    <div>
+                                        <span class="font-bold text-gray-800">获取邮箱时使用全局代理穿透</span>
+                                        <p class="form-hint mt-1 mb-0 text-gray-500">如果本机是国外服务器可保持 false</p>
+                                    </div>
+                                </label>
+
+                                <label class="form-checkbox-label p-3 bg-gray-50 rounded-lg border border-gray-100">
+                                    <input type="checkbox" v-model="config.enable_email_masking" class="form-checkbox mt-1 text-blue-600">
+                                    <div>
+                                        <span class="font-bold text-gray-800">隐藏日志中的邮箱域名</span>
+                                        <p class="form-hint mt-1 mb-0 text-gray-500">保护资产防偷窥</p>
+                                    </div>
+                                </label>
+                            </div>
+
+                            <div class="config-card border-l-4 border-yellow-400 bg-yellow-50/30">
+                                <h3 class="config-title text-yellow-600">🔑 渠道专属参数</h3>
+
+                                <div v-if="config.email_api_mode === 'cloudflare_temp_email'">
+                                    <p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: CF 临时邮箱</p>
+                                    <label class="form-label">后端 API 基础地址 (gptmail_base)</label>
+                                    <input type="text" v-model="config.gptmail_base" class="form-input">
+                                    <label class="form-label mt-4">管理员鉴权 (admin_auth)</label>
+                                    <div class="relative mb-2">
+                                        <input :type="showPwd.cf ? 'text' : 'password'" v-model="config.admin_auth" class="form-input pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.cf = !showPwd.cf" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                            {{ showPwd.cf ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/dreamhunter2333/cloudflare_temp_email</p>
+                                </div>
+                                
+                                <div v-if="config.email_api_mode === 'imap' && config.imap">
+                                    <p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: IMAP 接码</p>
+                                    <label class="form-label">服务器地址</label>
+                                    <input type="text" v-model="config.imap.server" class="form-input">
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div><label class="form-label">端口</label><input type="number" v-model.number="config.imap.port" class="form-input"></div>
+                                        <div><label class="form-label">接收账号</label><input type="text" v-model="config.imap.user" class="form-input"></div>
+                                    </div>
+                                    <label class="form-label mt-4">应用专用密码 (pass)</label>
+                                    <div class="relative mb-2">
+                                        <input :type="showPwd.imap ? 'text' : 'password'" v-model="config.imap.pass" class="form-input pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.imap = !showPwd.imap" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                            {{ showPwd.imap ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+                                </div>
+
+								<div v-if="config.email_api_mode === 'freemail' && config.freemail">
+									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: Freemail API</p>
+									
+									<label class="form-label">API URL</label>
+									<input type="text" v-model="config.freemail.api_url" class="form-input">
+									
+									<label class="form-label mt-4">API Token (用于发信/收件业务)</label>
+									<div class="relative mb-2">
+										<input :type="showPwd.free_token ? 'text' : 'password'" v-model="config.freemail.api_token" class="form-input pr-10" style="margin-bottom: 0;">
+										<button @click="showPwd.free_token = !showPwd.free_token" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+											{{ showPwd.free_token ? '👁️' : '🙈' }}
+										</button>
+									</div>
+
+									<div class="grid grid-cols-2 gap-4 mt-5 p-4 bg-gray-50 rounded-lg border border-gray-200">
+										<div class="col-span-2">
+											<p class="text-xs font-bold text-gray-500 mb-0">⬇️ 管理员配置 (仅用于往 CF 推送时自动同步二级域名)</p>
+										</div>
+										<div>
+											<label class="form-label">管理员账号</label>
+											<input type="text" v-model="config.freemail.admin_username" class="form-input bg-white" placeholder="默认: admin">
+										</div>
+										<div>
+											<label class="form-label">管理员密码</label>
+											<div class="relative mb-2">
+												<input :type="showPwd.free_pass ? 'text' : 'password'" v-model="config.freemail.admin_password" class="form-input bg-white pr-10" style="margin-bottom: 0;">
+												<button @click="showPwd.free_pass = !showPwd.free_pass" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+													{{ showPwd.free_pass ? '👁️' : '🙈' }}
+												</button>
+											</div>
+										</div>
+									</div>
+									<p class="text-sm text-yellow-700 mt-4 mb-0 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/smanx/freemail</p>
+									<p class="text-sm text-yellow-700 mt-4 mb-0 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">如果开启二级域名泛解析模式需要部署魔改项目：https://github.com/Msg-Lbo/mailfree</p>
+								</div>
+
+                                <div v-if="config.email_api_mode === 'cloudmail' && config.cloudmail">
+                                    <p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: CloudMail</p>
+                                    <label class="form-label">API URL</label>
+                                    <input type="text" v-model="config.cloudmail.api_url" class="form-input">
+                                    <label class="form-label mt-4">管理员账号</label>
+                                    <input type="text" v-model="config.cloudmail.admin_email" class="form-input">
+                                    <label class="form-label mt-4">管理员密码</label>
+                                    <div class="relative mb-2">
+                                        <input :type="showPwd.cm ? 'text' : 'password'" v-model="config.cloudmail.admin_password" class="form-input pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.cm = !showPwd.cm" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                            {{ showPwd.cm ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/maillab/cloud-mail</p>
+                                </div>
+
+                                <div v-if="config.email_api_mode === 'mail_curl' && config.mail_curl">
+                                    <p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: Mail Curl</p>
+                                    <label class="form-label">API Base</label>
+                                    <input type="text" v-model="config.mail_curl.api_base" class="form-input">
+                                    <label class="form-label mt-4">Key (密钥)</label>
+                                    <div class="relative mb-2">
+                                        <input :type="showPwd.mc ? 'text' : 'password'" v-model="config.mail_curl.key" class="form-input pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.mc = !showPwd.mc" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                            {{ showPwd.mc ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/s12ryt/mail-curl</p>
+                                </div>
+
+								<div v-if="config.email_api_mode === 'luckmail' && config.luckmail">
+                                    <p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">当前激活: LuckMail 接码</p>
+                                    <label class="form-label">API Key (密钥)</label>
+                                    <div class="relative mb-2">
+                                        <input :type="showPwd.luckmail ? 'text' : 'password'" v-model="config.luckmail.api_key" class="form-input pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.luckmail = !showPwd.luckmail" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                            {{ showPwd.luckmail ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+									<label class="form-label">指定邮箱后缀</label>
+                                    <select v-model="config.luckmail.preferred_domain" class="form-input bg-white font-bold text-gray-700 shadow-sm">
+                                        <option value="">不限制 (随机分配)</option>
+                                        <option value="outlook.com">outlook.com</option>
+                                        <option value="hotmail.com">hotmail.com</option>
+                                    </select>
+									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://mails.luckyous.com/</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div v-show="currentTab === 'proxy'" v-if="config" class="space-y-6">
+                            <div class="config-card max-w-2xl">
+                                <h3 class="config-title text-green-600">🌐 基础代理设置</h3>
+                                <label class="form-label">全局默认代理 (default_proxy)</label>
+                                <span class="form-hint">基础请求代理地址，如 http://127.0.0.1:7897</span>
+                                <input type="text" v-model="config.default_proxy" placeholder="如 http://127.0.0.1:7897" class="form-input font-mono text-gray-600 mb-0">
+                            </div>
+
+                            <div class="config-card border-l-4 border-indigo-500 bg-indigo-50/20" v-if="config.clash_proxy_pool">
+                                <div class="flex justify-between items-center mb-6 border-b border-indigo-100 pb-4">
+                                    <h3 class="config-title text-indigo-700 border-none mb-0 pb-0">🌍 Clash 节点智能池</h3>
+                                    <label class="form-checkbox-label mb-0 bg-indigo-100 px-4 py-2 rounded-lg cursor-pointer hover:bg-indigo-200 transition">
+                                        <input type="checkbox" v-model="config.clash_proxy_pool.enable" class="form-checkbox w-5 h-5 text-indigo-600 border-indigo-300">
+                                        <span class="font-extrabold text-indigo-900 ml-1">开启 Clash API 智能切点</span>
+                                    </label>
+                                </div>
+                                
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-8" :class="{'opacity-50 pointer-events-none grayscale-[50%]': !config.clash_proxy_pool.enable}">
+                                    <div>
+                                        <div class="flex gap-4 mb-5">
+                                            <label class="form-checkbox-label text-red-600 font-bold bg-red-50 p-3 rounded border border-red-100 w-full"><input type="checkbox" v-model="config.clash_proxy_pool.pool_mode" class="form-checkbox text-red-500"><span>多容器独享池模式</span></label>
+                                            <label class="form-checkbox-label text-green-600 font-bold bg-green-50 p-3 rounded border border-green-100 w-full"><input type="checkbox" v-model="config.clash_proxy_pool.fastest_mode" class="form-checkbox text-green-500"><span>开启延迟测速优选</span></label>
+                                        </div>
+                                        <label class="form-label">控制台 API 地址</label>
+                                        <input type="text" v-model="config.clash_proxy_pool.api_url" class="form-input font-mono">
+                                        <label class="form-label">代理策略组名称</label>
+                                        <input type="text" v-model="config.clash_proxy_pool.group_name" class="form-input">
+                                        
+                                        <label class="form-label mt-4">鉴权 Secret</label>
+                                        <div class="relative mb-4">
+                                            <input :type="showPwd.clash ? 'text' : 'password'" v-model="config.clash_proxy_pool.secret" class="form-input pr-10" style="margin-bottom: 0;">
+                                            <button @click="showPwd.clash = !showPwd.clash" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                                {{ showPwd.clash ? '👁️' : '🙈' }}
+                                            </button>
+                                        </div>
+                                        
+                                        <label class="form-label">测活校验地址</label>
+                                        <input type="text" v-model="config.clash_proxy_pool.test_proxy_url" class="form-input font-mono">
+                                    </div>
+                                    <div class="space-y-5">
+                                        <div>
+                                            <label class="form-label font-bold text-gray-700">节点过滤黑名单 (blacklist) <span class="text-xs font-normal text-gray-400">换行分隔</span></label>
+                                            <textarea v-model="blacklistStr" class="form-input h-[150px] font-mono text-xs leading-relaxed" placeholder="如: 故障、官网、HK、CN"></textarea>
+                                        </div>
+                                        <div v-if="config.clash_proxy_pool.pool_mode">
+                                            <label class="form-label font-bold text-blue-600">独立端口池列队 (warp_proxy_list) <span class="text-xs font-normal text-blue-400">换行分隔</span></label>
+                                            <textarea v-model="warpListStr" class="form-input h-[150px] font-mono text-xs leading-relaxed border-blue-200 bg-blue-50" placeholder="http://127.0.0.1:41001"></textarea>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+						<div v-show="currentTab === 'relay'" v-if="config" class="space-y-6">
+                            <div class="config-card border-t-8 border-green-500" v-if="config.cpa_mode">
+                                <div class="flex justify-between items-center mb-6 border-b border-gray-100 pb-4">
+                                    <div>
+                                        <h3 class="config-title text-green-700 border-none mb-0 pb-0 text-2xl">📦 CPA 智能仓管中心</h3>
+                                    </div>
+                                    <label class="form-checkbox-label mb-0 bg-green-100 px-5 py-3 rounded-xl cursor-pointer hover:bg-green-200 transition shadow-sm">
+                                        <input type="checkbox" v-model="config.cpa_mode.enable" @change="config.cpa_mode.enable ? config.sub2api_mode.enable = false : null" class="form-checkbox w-6 h-6 text-green-600 border-green-300">
+                                        <span class="font-black text-green-900 text-lg ml-2">主开关：开启 CPA 仓管</span>
+                                    </label>
+                                </div>
+
+                                <div class="grid grid-cols-1 md:grid-cols-3 gap-8" :class="{'opacity-50 pointer-events-none grayscale-[50%]': !config.cpa_mode.enable}">
+                                    <div class="col-span-1 space-y-4 bg-gray-50 p-5 rounded-xl border border-gray-200">
+                                        <div><label class="form-label font-bold">CPA 平台 API 地址</label><input type="text" v-model="config.cpa_mode.api_url" class="form-input border-green-200 bg-white"></div>
+                                        <div>
+                                            <label class="form-label font-bold mt-4">API Token</label>
+                                            <div class="relative">
+                                                <input :type="showPwd.cpa ? 'text' : 'password'" v-model="config.cpa_mode.api_token" class="form-input border-green-200 bg-white pr-10" style="margin-bottom: 0;">
+                                                <button @click="showPwd.cpa = !showPwd.cpa" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                                    {{ showPwd.cpa ? '👁️' : '🙈' }}
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <label class="form-checkbox-label text-blue-700 font-bold mt-6 bg-blue-100 p-3 rounded-lg"><input type="checkbox" v-model="config.cpa_mode.save_to_local" class="form-checkbox text-blue-600 w-5 h-5"><span class="ml-2">同步备份到账号库</span></label>
+                                    </div>
+
+                                    <div class="col-span-2 grid grid-cols-2 gap-x-6 gap-y-5">
+                                        <div><label class="form-label">库存报警触发阈值 (个)</label><input type="number" v-model.number="config.cpa_mode.min_accounts_threshold" class="form-input font-bold text-gray-700 text-lg"></div>
+                                        <div><label class="form-label">单次触发补发量 (个)</label><input type="number" v-model.number="config.cpa_mode.batch_reg_count" class="form-input font-bold text-green-600 text-lg"></div>
+                                        <div><label class="form-label">仓库巡检间隔 (分钟)</label><input type="number" v-model.number="config.cpa_mode.check_interval_minutes" class="form-input"></div>
+                                        <div><label class="form-label">多线程测活并发数</label><input type="number" v-model.number="config.cpa_mode.threads" class="form-input"></div>
+                                        
+                                        <div class="col-span-2 bg-red-50 p-5 rounded-xl border border-red-100 mt-2 flex flex-col sm:flex-row gap-6">
+                                            <div class="w-full sm:w-1/3">
+                                                <label class="form-label text-red-800 font-bold">周限额剔除阈值 (%)</label>
+                                                <span class="form-hint text-red-600">低于此额度被视为无效</span>
+                                                <input type="number" v-model.number="config.cpa_mode.min_remaining_weekly_percent" class="form-input border-red-300 font-black text-red-600 text-xl text-center">
+                                            </div>
+                                            <div class="w-full sm:w-2/3 flex flex-col justify-center space-y-3">
+                                                <label class="form-checkbox-label text-red-800 mb-0 bg-white p-2 rounded border border-red-100"><input type="checkbox" v-model="config.cpa_mode.remove_on_limit_reached" class="form-checkbox text-red-600"><span class="text-sm font-bold ml-1">额度耗尽自动物理删除 (而非禁用)</span></label>
+                                                <label class="form-checkbox-label text-red-800 mb-0 bg-white p-2 rounded border border-red-100"><input type="checkbox" v-model="config.cpa_mode.remove_dead_accounts" class="form-checkbox text-red-600"><span class="text-sm font-bold ml-1">凭证彻底死亡自动物理删除</span></label>
+                                                <label class="form-checkbox-label text-blue-800 mb-0 bg-blue-50 p-2 rounded border border-blue-100"><input type="checkbox" v-model="config.cpa_mode.enable_token_revive" class="form-checkbox text-blue-600"><span class="text-sm font-bold ml-1">尝试 Refresh Token 复活</span></label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="config-card border-t-8 border-purple-500" v-if="config.sub2api_mode">
+                                <div class="flex justify-between items-center mb-6 border-b border-gray-100 pb-4">
+                                    <div>
+                                        <h3 class="config-title text-purple-700 border-none mb-0 pb-0 text-2xl">🛸 Sub2API 仓管中心</h3>
+                                    </div>
+                                    <label class="form-checkbox-label mb-0 bg-purple-100 px-5 py-3 rounded-xl cursor-pointer hover:bg-purple-200 transition shadow-sm">
+                                        <input type="checkbox" v-model="config.sub2api_mode.enable" @change="config.sub2api_mode.enable ? config.cpa_mode.enable = false : null" class="form-checkbox w-6 h-6 text-purple-600 border-purple-300">
+                                        <span class="font-black text-purple-900 text-lg ml-2">主开关：开启 Sub2API</span>
+                                    </label>
+                                </div>
+
+                                <div class="grid grid-cols-1 md:grid-cols-3 gap-8" :class="{'opacity-50 pointer-events-none grayscale-[50%]': !config.sub2api_mode.enable}">
+                                    <div class="col-span-1 space-y-4 bg-gray-50 p-5 rounded-xl border border-gray-200">
+                                        <div>
+                                            <label class="form-label font-bold">Sub2API 接口地址</label>
+                                            <input type="text" v-model="config.sub2api_mode.api_url" class="form-input border-purple-200 bg-white">
+                                        </div>
+                                        <div>
+                                            <label class="form-label font-bold mt-4">API Key</label>
+                                            <div class="relative">
+                                                <input :type="showPwd.sub2api ? 'text' : 'password'" v-model="config.sub2api_mode.api_key" class="form-input border-purple-200 bg-white pr-10" style="margin-bottom: 0;">
+                                                <button @click="showPwd.sub2api = !showPwd.sub2api" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+                                                    {{ showPwd.sub2api ? '👁️' : '🙈' }}
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <label class="form-checkbox-label text-blue-700 font-bold mt-6 bg-blue-100 p-3 rounded-lg">
+                                            <input type="checkbox" v-model="config.sub2api_mode.save_to_local" class="form-checkbox text-blue-600 w-5 h-5">
+                                            <span class="ml-2">同步备份到账号库</span>
+                                        </label>
+                                    </div>
+
+                                    <div class="col-span-2 grid grid-cols-2 gap-x-6 gap-y-5">
+                                        <div><label class="form-label">库存报警触发阈值 (个)</label><input type="number" v-model.number="config.sub2api_mode.min_accounts_threshold" class="form-input font-bold text-gray-700 text-lg"></div>
+                                        <div><label class="form-label">单次触发补发量 (个)</label><input type="number" v-model.number="config.sub2api_mode.batch_reg_count" class="form-input font-bold text-purple-600 text-lg"></div>
+                                        <div><label class="form-label">仓库巡检间隔 (分钟)</label><input type="number" v-model.number="config.sub2api_mode.check_interval_minutes" class="form-input"></div>
+                                        <div><label class="form-label">多线程测活并发数</label><input type="number" v-model.number="config.sub2api_mode.threads" class="form-input"></div>
+                                        
+                                        <div class="col-span-2 bg-red-50 p-5 rounded-xl border border-red-100 mt-2 flex flex-col sm:flex-row gap-6">
+                                            <div class="w-full sm:w-1/3">
+                                                <label class="form-label text-red-800 font-bold">周限额剔除阈值 (%)</label>
+                                                <span class="form-hint text-red-600">低于此额度被视为无效</span>
+                                                <input type="number" v-model.number="config.sub2api_mode.min_remaining_weekly_percent" class="form-input border-red-300 font-black text-red-600 text-xl text-center">
+                                            </div>
+                                            <div class="w-full sm:w-2/3 flex flex-col justify-center space-y-3">
+                                                <label class="form-checkbox-label text-red-800 mb-0 bg-white p-2 rounded border border-red-100">
+                                                    <input type="checkbox" v-model="config.sub2api_mode.remove_on_limit_reached" class="form-checkbox text-red-600">
+                                                    <span class="text-sm font-bold ml-1">额度耗尽自动物理删除 (而非禁用)</span>
+                                                </label>
+                                                <label class="form-checkbox-label text-red-800 mb-0 bg-white p-2 rounded border border-red-100">
+                                                    <input type="checkbox" v-model="config.sub2api_mode.remove_dead_accounts" class="form-checkbox text-red-600">
+                                                    <span class="text-sm font-bold ml-1">凭证彻底死亡自动物理删除</span>
+                                                </label>
+                                                <label class="form-checkbox-label text-blue-800 mb-0 bg-blue-50 p-2 rounded border border-blue-100">
+                                                    <input type="checkbox" v-model="config.sub2api_mode.enable_token_revive" class="form-checkbox text-blue-600">
+                                                    <span class="text-sm font-bold ml-1">尝试 Refresh Token 复活</span>
+                                                </label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div v-show="currentTab === 'concurrency'" v-if="config" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            
+                            <div class="config-card border-t-4 border-gray-400">
+                                <h3 class="config-title">🔒 杂项与安全控制</h3>
+                                <div class="mb-5 bg-red-50 p-4 rounded-xl border border-red-100">
+                                    <label class="form-label text-red-700">Web 控制台保护密码 (web_password)</label>
+                                    <div class="relative mb-0">
+                                        <input :type="showPwd.web ? 'text' : 'password'" v-model="config.web_password" class="form-input border-red-200 font-extrabold text-red-700 shadow-sm pr-10" style="margin-bottom: 0;">
+                                        <button @click="showPwd.web = !showPwd.web" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-red-600 focus:outline-none">
+                                            {{ showPwd.web ? '👁️' : '🙈' }}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="config-card border-t-4 border-yellow-400">
+                                <h3 class="config-title">⚡ 并发与时延微调</h3>
+                                <div class="bg-yellow-50 p-4 rounded-xl border border-yellow-200 mb-5">
+                                    <label class="form-checkbox-label font-bold text-yellow-900 mb-3">
+                                        <input type="checkbox" v-model="config.enable_multi_thread_reg" class="form-checkbox text-yellow-600 w-5 h-5">
+                                        <span class="ml-1 text-base">允许注册多线程并发</span>
+                                    </label>
+                                    <div class="flex items-center gap-3">
+                                        <label class="form-label text-yellow-800 mb-0 w-24">线程数量</label>
+                                        <input type="number" v-model.number="config.reg_threads" :disabled="!config.enable_multi_thread_reg" class="form-input mb-0 w-24 text-center font-bold text-yellow-700 border-yellow-300">
+                                    </div>
+                                </div>
+                                
+                                <div class="flex items-center gap-4 mb-5">
+                                    <div class="flex-1">
+                                        <label class="form-label text-gray-600">获取 Token 最小等待秒</label>
+                                        <input type="number" v-model.number="config.login_delay_min" class="form-input mb-0">
+                                    </div>
+                                    <div class="flex-1">
+                                        <label class="form-label text-gray-600">最大等待秒 (login_delay)</label>
+                                        <input type="number" v-model.number="config.login_delay_max" class="form-input mb-0">
+                                    </div>
+                                </div>
+                                <label class="form-label text-gray-600">验证码 (OTP) 重新请求上限次数</label>
+                                <input type="number" v-model.number="config.max_otp_retries" class="form-input">
+                            </div>
+
+                            <div class="config-card md:col-span-2 border-t-4 border-blue-500 bg-blue-50/20" v-if="config.normal_mode">
+                                <h3 class="config-title text-blue-700 border-b-blue-200">⚙️ 常规量产模式边界控制 (normal_mode)</h3>
+                                <div class="flex flex-col md:flex-row gap-6 items-end">
+                                    <div class="flex-1 w-full">
+                                        <label class="form-label">注册成功后防风控缓冲范围 (秒)</label>
+                                        <div class="flex items-center gap-2">
+                                            <input type="number" v-model.number="config.normal_mode.sleep_min" class="form-input mb-0 text-center" placeholder="最小">
+                                            <span class="text-gray-400 font-bold">~</span>
+                                            <input type="number" v-model.number="config.normal_mode.sleep_max" class="form-input mb-0 text-center" placeholder="最大">
+                                        </div>
+                                    </div>
+                                    <div class="w-full md:w-1/3">
+                                        <label class="form-label font-bold text-blue-800">该模式下单次产出目标 <span class="text-xs font-normal text-blue-500">(0为无限)</span></label>
+                                        <input type="number" v-model.number="config.normal_mode.target_count" class="form-input border-blue-300 font-black text-blue-700 text-xl text-center mb-0">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -8,27 +8,51 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-config_path = "config.yaml"
-if not os.path.exists(config_path):
-    print(f"[ERROR] 配置文件 {config_path} 不存在，使用默认配置。")
-    config = {}
-else:
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f) or {}
+CLASH_API_URL = ""
+LOCAL_PROXY_URL = ""
+ENABLE_NODE_SWITCH = False
+POOL_MODE = False
+FASTEST_MODE = False
+PROXY_GROUP_NAME = "节点选择"
+CLASH_SECRET = ""
+NODE_BLACKLIST = []
+_IS_IN_DOCKER = os.path.exists('/.dockerenv')
 
-clash_conf = config.get("clash_proxy_pool", {})
-ENABLE_NODE_SWITCH = clash_conf.get("enable", False)
+def format_docker_url(url: str) -> str:
+    """智能检测：如果在 Docker 中运行，自动把 127.0.0.1 转为宿主机魔法地址"""
+    if not url or not isinstance(url, str):
+        return url
+    if _IS_IN_DOCKER:
+        if "127.0.0.1" in url:
+            return url.replace("127.0.0.1", "host.docker.internal")
+        if "localhost" in url:
+            return url.replace("localhost", "host.docker.internal")
+    return url
 
-POOL_MODE = clash_conf.get("pool_mode", False)
-FASTEST_MODE = clash_conf.get("fastest_mode", False)
+def reload_proxy_config():
+    global CLASH_API_URL, LOCAL_PROXY_URL, ENABLE_NODE_SWITCH, POOL_MODE, \
+           FASTEST_MODE, PROXY_GROUP_NAME, CLASH_SECRET, NODE_BLACKLIST
 
-CLASH_API_URL = clash_conf.get("api_url", "http://127.0.0.1:9090")
-LOCAL_PROXY_URL = clash_conf.get("test_proxy_url", "http://127.0.0.1:7890")
+    config_path = "config.yaml"
+    if not os.path.exists(config_path):
+        print(f"[{ts()}] [WARNING] 配置文件 {config_path} 不存在，使用默认代理设置。")
+        conf_data = {}
+    else:
+        with open(config_path, "r", encoding="utf-8") as f:
+            conf_data = yaml.safe_load(f) or {}
 
-PROXY_GROUP_NAME = clash_conf.get("group_name", "节点选择")
-CLASH_SECRET = clash_conf.get("secret", "")
-DEFAULT_BLACKLIST = ["港", "HK", "台", "TW", "中", "CN"]
-NODE_BLACKLIST = clash_conf.get("blacklist", DEFAULT_BLACKLIST)
+    clash_conf = conf_data.get("clash_proxy_pool", {})
+    ENABLE_NODE_SWITCH = clash_conf.get("enable", False)
+    POOL_MODE = clash_conf.get("pool_mode", False)
+    FASTEST_MODE = clash_conf.get("fastest_mode", False)
+    CLASH_API_URL = format_docker_url(clash_conf.get("api_url", "http://127.0.0.1:9090"))
+    LOCAL_PROXY_URL = format_docker_url(clash_conf.get("test_proxy_url", "http://127.0.0.1:7890"))
+    
+    PROXY_GROUP_NAME = clash_conf.get("group_name", "节点选择")
+    CLASH_SECRET = clash_conf.get("secret", "")
+    NODE_BLACKLIST = clash_conf.get("blacklist", ["港", "HK", "台", "TW", "中国", "CN"])
+   
+    print(f"[{ts()}] [系统] 代理管理模块配置已同步更新。")
 
 def ts() -> str:
     """获取当前时间戳字符串，用于日志"""
@@ -66,14 +90,15 @@ def get_api_url_for_proxy(proxy_url: str) -> str:
         port = parsed.port
         if port and 41000 < port <= 41050:
             api_port = port + 1000
-            return f"http://{parsed.hostname}:{api_port}"
+            return format_docker_url(f"http://{parsed.hostname}:{api_port}")
     except Exception:
         pass
     return CLASH_API_URL
 
 def test_proxy_liveness(proxy_url=None):
     """测试当前代理是否可用 (脱敏)"""
-    target_proxy = proxy_url if proxy_url else LOCAL_PROXY_URL
+    raw_url = proxy_url if proxy_url else LOCAL_PROXY_URL
+    target_proxy = format_docker_url(raw_url)
     proxies = {"http": target_proxy, "https": target_proxy}
     display_name = get_display_name(proxy_url if proxy_url else LOCAL_PROXY_URL)
     
@@ -141,18 +166,24 @@ def smart_switch_node(proxy_url=None):
 
         if FASTEST_MODE:
             print(f"\n[{ts()}] [代理池] {display_name} 开启优选模式，并发测速 {len(valid_nodes)} 个节点...")
+            
+            session = std_requests.Session()
+            
             def trigger_delay(n):
-                enc_n = urllib.parse.quote(n)
+                enc_n = urllib.parse.quote(n, safe="")
                 try:
-                    std_requests.get(
-                        f"{current_api_url}/proxies/{enc_n}/delay?timeout=3000&url=http://www.gstatic.com/generate_204", 
-                        headers=headers, timeout=4
+                    session.get(
+                        f"{current_api_url}/proxies/{enc_n}/delay?timeout=2000&url=http://www.gstatic.com/generate_204", 
+                        headers=headers, timeout=2.5
                     )
                 except:
                     pass
-                    
-            with ThreadPoolExecutor(max_workers=10) as executor:
+
+            thread_count = min(10, len(valid_nodes))
+            with ThreadPoolExecutor(max_workers=thread_count) as executor:
                 executor.map(trigger_delay, valid_nodes)
+                
+            session.close()
                 
             time.sleep(1.5)
             
@@ -212,3 +243,5 @@ def smart_switch_node(proxy_url=None):
     except Exception as e:
         print(f"[{ts()}] [ERROR] {display_name} 切换节点异常: {e}")
         return False
+
+reload_proxy_config()

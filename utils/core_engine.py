@@ -1,0 +1,1149 @@
+"""
+调度层
+配置热加载、CPA 仓管逻辑、主循环、RegEngine 控制类。
+邮箱逻辑 → mail_service.py
+注册流程 → register.py
+配置变量 → config.py
+"""
+
+import argparse
+import asyncio
+import builtins
+import io
+import json
+import os
+import random
+import re
+import threading
+import time
+import string
+import yaml
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Optional, Tuple
+from curl_cffi import requests, CurlMime
+
+from utils import mail_service
+from utils import config as cfg
+from utils import db_manager
+from utils.config import reload_all_configs, ts, format_docker_url
+from utils.mail_service import mask_email
+from utils.register import run, refresh_oauth_token as _refresh_oauth_token
+from utils.proxy_manager import smart_switch_node
+from utils.sub2api_client import Sub2APIClient
+
+
+sub_fail_counts = {}
+_heal_lock = threading.Lock()
+DEFAULT_CLIPROXY_UA = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+run_stats = {
+    "success": 0,
+    "failed": 0,
+    "retries": 0,
+    "start_time": 0,
+    "target": 0
+}
+KNOWN_CLIPROXY_ERROR_LABELS = {
+    "usage_limit_reached":  "周限额已耗尽",
+    "account_deactivated":  "账号已停用",
+    "insufficient_quota":   "额度不足",
+    "invalid_api_key":      "凭证无效",
+    "unsupported_region":   "地区不支持",
+}
+
+log_queue    = __import__("queue").Queue()
+_orig_print  = builtins.print
+_thread_local = threading.local()
+_print_lock   = threading.Lock()
+
+
+def web_print(*args, **kwargs):
+    if "file" in kwargs and kwargs["file"] is not None:
+        with _print_lock:
+            _orig_print(*args, **kwargs)
+        return
+    if not hasattr(_thread_local, "buffer"):
+        _thread_local.buffer = ""
+    tmp = io.StringIO()
+    _orig_print(*args, file=tmp, **kwargs)
+    _thread_local.buffer += tmp.getvalue()
+    if _thread_local.buffer.endswith("\n"):
+        with _print_lock:
+            msg = _thread_local.buffer.lstrip("\n")
+            if msg and msg.strip() != ".":
+                log_queue.put(msg.strip())
+        _thread_local.buffer = ""
+
+
+builtins.print = web_print
+
+def _load_dotenv(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
+def _normalize_cpa_auth_files_url(api_url: str) -> str:
+    normalized = (api_url or "").strip().rstrip("/")
+    lower = normalized.lower()
+    if not normalized:
+        return ""
+    if lower.endswith("/auth-files"):
+        return normalized
+    if lower.endswith("/v0/management") or lower.endswith("/management"):
+        return f"{normalized}/auth-files"
+    if lower.endswith("/v0"):
+        return f"{normalized}/management/auth-files"
+    return f"{normalized}/v0/management/auth-files"
+
+
+def set_cpa_auth_file_status(
+    api_url: str, api_token: str, filename: str, disabled: bool = True
+) -> bool:
+    status_url = f"{_normalize_cpa_auth_files_url(api_url)}/status"
+    try:
+        res = requests.patch(
+            status_url,
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json={"name": filename, "disabled": disabled},
+            timeout=15, impersonate="chrome110",
+        )
+        if res.status_code in (200, 204):
+            return True
+        print(f"[{ts()}] [ERROR] 切换凭证状态失败 (HTTP {res.status_code}): {res.text}")
+        return False
+    except Exception as e:
+        print(f"[{ts()}] [ERROR] 切换凭证状态异常: {e}")
+        return False
+
+
+def upload_to_cpa_integrated(
+    token_data: dict, api_url: str, api_token: str, custom_filename: str = None
+) -> Tuple[bool, str]:
+    upload_url = _normalize_cpa_auth_files_url(api_url)
+    filename   = custom_filename or f"{token_data.get('email', 'unknown')}.json"
+    file_content = json.dumps(token_data, ensure_ascii=False, indent=2).encode("utf-8")
+    try:
+        mime = CurlMime()
+        mime.addpart(name="file", data=file_content, filename=filename,
+                     content_type="application/json")
+        resp = requests.post(
+            upload_url, multipart=mime,
+            headers={"Authorization": f"Bearer {api_token}"},
+            timeout=30, impersonate="chrome110",
+        )
+        if resp.status_code in (200, 201):
+            return True, "上传成功"
+        if resp.status_code in (404, 405, 415):
+            raw_url = f"{upload_url}?name={urllib.parse.quote(filename)}"
+            fb = requests.post(
+                raw_url, data=file_content,
+                headers={"Authorization": f"Bearer {api_token}",
+                         "Content-Type": "application/json"},
+                timeout=30, impersonate="chrome110",
+            )
+            if fb.status_code in (200, 201):
+                return True, "上传成功"
+            resp = fb
+        return False, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _decode_possible_json_payload(payload: Any) -> Any:
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            return payload
+        try:
+            return json.loads(text)
+        except Exception:
+            return payload
+    return payload
+
+
+def _extract_remaining_percent(window_info: Any) -> Optional[float]:
+    if not isinstance(window_info, dict):
+        return None
+    remaining_percent = window_info.get("remaining_percent")
+    if isinstance(remaining_percent, (int, float)):
+        return max(0.0, min(100.0, float(remaining_percent)))
+    used_percent = window_info.get("used_percent")
+    if isinstance(used_percent, (int, float)):
+        return max(0.0, min(100.0, 100.0 - float(used_percent)))
+    return None
+
+
+def _format_percent(value: float) -> str:
+    n = round(float(value), 2)
+    return str(int(n)) if n.is_integer() else f"{n:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_known_cliproxy_error(error_type: str) -> str:
+    label = KNOWN_CLIPROXY_ERROR_LABELS.get(error_type)
+    return f"{label} ({error_type})" if label else f"错误类型: {error_type}"
+
+
+def _extract_rate_limit_reason(
+    rate_info: Any, key: str, min_remaining_weekly_percent: int = 0
+) -> Optional[str]:
+    if not isinstance(rate_info, dict):
+        return None
+    if rate_info.get("allowed") is False or rate_info.get("limit_reached") is True:
+        label = {"rate_limit": "周限额已耗尽", "code_review_rate_limit": "代码审查周限额已耗尽"}.get(
+            key, f"{key} 已耗尽"
+        )
+        return f"{label}（allowed={rate_info.get('allowed')}, limit_reached={rate_info.get('limit_reached')}）"
+    if key == "rate_limit" and min_remaining_weekly_percent > 0:
+        pct = _extract_remaining_percent(rate_info.get("primary_window"))
+        if pct is not None and pct < min_remaining_weekly_percent:
+            return f"周限额剩余 {_format_percent(pct)}%，低于阈值 {min_remaining_weekly_percent}%"
+    return None
+
+
+def _extract_cliproxy_failure_reason(
+    payload: Any, min_remaining_weekly_percent: int = 0
+) -> Optional[str]:
+    data = _decode_possible_json_payload(payload)
+    if isinstance(data, str):
+        for kw in KNOWN_CLIPROXY_ERROR_LABELS:
+            if kw in data:
+                return _format_known_cliproxy_error(kw)
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if isinstance(error, dict):
+        et = error.get("type")
+        if et:
+            return _format_known_cliproxy_error(et)
+        msg = error.get("message")
+        if msg:
+            return str(msg)
+    for key in ("rate_limit", "code_review_rate_limit"):
+        pct = min_remaining_weekly_percent if key == "rate_limit" else 0
+        reason = _extract_rate_limit_reason(data.get(key), key, pct)
+        if reason:
+            return reason
+    arl = data.get("additional_rate_limits")
+    if isinstance(arl, list):
+        for i, ri in enumerate(arl):
+            r = _extract_rate_limit_reason(ri, f"additional_rate_limits[{i}]", 0)
+            if r:
+                return r
+    elif isinstance(arl, dict):
+        for k, ri in arl.items():
+            r = _extract_rate_limit_reason(ri, f"additional_rate_limits.{k}", 0)
+            if r:
+                return r
+    for k in ("data", "body", "response", "text", "content", "status_message"):
+        r = _extract_cliproxy_failure_reason(data.get(k), min_remaining_weekly_percent)
+        if r:
+            return r
+    data_str = json.dumps(data, ensure_ascii=False)
+    for kw in KNOWN_CLIPROXY_ERROR_LABELS:
+        if kw in data_str:
+            return _format_known_cliproxy_error(kw)
+    return None
+
+
+def refresh_oauth_token(refresh_token: str, proxies: Any = None) -> Tuple[bool, dict]:
+    """刷新获取新的 access_token 等凭证"""
+    return _refresh_oauth_token(refresh_token, proxies=proxies)
+
+
+def test_cliproxy_auth_file(item: dict, api_url: str, api_token: str) -> Tuple[bool, str]:
+    auth_index = item.get("auth_index")
+    base_url   = api_url.strip().rstrip("/")
+    call_url   = (
+        base_url.replace("/auth-files", "/api-call")
+        if "/auth-files" in base_url
+        else f"{base_url}/v0/management/api-call"
+    )
+    payload = {
+        "authIndex": auth_index,
+        "method":    "GET",
+        "url":       "https://chatgpt.com/backend-api/wham/usage",
+        "header": {
+            "Authorization":     "Bearer $TOKEN$",
+            "Content-Type":      "application/json",
+            "User-Agent":        DEFAULT_CLIPROXY_UA,
+            "Chatgpt-Account-Id": str(item.get("account_id") or ""),
+        },
+    }
+    try:
+        resp = requests.post(
+            call_url,
+            headers={"Authorization": f"Bearer {api_token}"},
+            json=payload, timeout=60, impersonate="chrome110",
+        )
+        if resp.status_code != 200:
+            return False, f"HTTP {resp.status_code}"
+        data        = resp.json()
+        status_code = data.get("status_code", 0)
+        reason      = _extract_cliproxy_failure_reason(data, cfg.MIN_REMAINING_WEEKLY_PERCENT)
+        if status_code >= 400 or reason:
+            return False, reason or f"HTTP {status_code}"
+        return True, "正常"
+    except Exception:
+        return False, "测活超时"
+
+def test_sub2api_account_direct(item: dict, proxy: str) -> Tuple[bool, str]:
+    """直连 OpenAI 接口进行 Sub2API 账号测活，并实时提取真实额度"""
+    credentials = item.get("credentials", {})
+    access_token = credentials.get("access_token")
+    account_id = credentials.get("chatgpt_account_id", "")
+    
+    if not access_token:
+        return False, "缺少 access_token"
+        
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": DEFAULT_CLIPROXY_UA,
+        "Accept": "application/json"
+    }
+    if account_id:
+        headers["Chatgpt-Account-Id"] = account_id
+
+    try:
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        
+        resp = requests.get(
+            "https://chatgpt.com/backend-api/wham/usage",
+            headers=headers,
+            proxies=proxies,
+            timeout=30,
+            impersonate="chrome110"
+        )
+        
+        if resp.status_code != 200:
+            if resp.status_code == 401: return False, "凭证无效 (HTTP 401)"
+            if resp.status_code == 403: return False, "请求被拒绝 (HTTP 403)"
+            return False, f"HTTP {resp.status_code}"
+            
+        data = resp.json()
+        
+        reason = _extract_cliproxy_failure_reason(data, cfg.SUB2API_MIN_REMAINING_WEEKLY_PERCENT)
+        if reason:
+            return False, reason
+            
+        pct_str = "未知"
+        rl_data = data.get("rate_limit", {})
+        if isinstance(rl_data, dict):
+            pct = _extract_remaining_percent(rl_data.get("primary_window"))
+            if pct is not None:
+                pct_str = f"{pct:.1f}%"
+                
+        return True, f"实时剩余: {pct_str}"
+    except Exception as e:
+        return False, f"测活异常: {e}"
+
+def process_account_worker(i: int, total: int, item: dict, args: Any) -> bool:
+    if hasattr(args, 'check_stop') and args.check_stop(): return False
+    name        = item.get("name")
+    is_disabled = item.get("disabled", False)
+    is_ok, msg  = test_cliproxy_auth_file(item, cfg.CPA_API_URL, cfg.CPA_API_TOKEN)
+
+    if is_ok:
+        if is_disabled:
+            print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 额度已恢复且有效，准备启用...")
+            ok = set_cpa_auth_file_status(cfg.CPA_API_URL, cfg.CPA_API_TOKEN, name, disabled=False)
+            print(
+                f"[{ts()}] [{'SUCCESS' if ok else 'ERROR'}] 凭证 {mask_email(name)} "
+                f"{'已成功启用！' if ok else '启用失败。'}"
+            )
+            return ok
+        print(f"[{ts()}] [INFO] 测活: {mask_email(name)} 状态健康")
+        return True
+
+    print(f"[{ts()}] [WARNING] 测活: 凭证 {mask_email(name)} 失效，原因: {msg}")
+
+    if "周限额" in msg or "usage_limit_reached" in msg:
+        if cfg.REMOVE_ON_LIMIT_REACHED:
+            print(f"[{ts()}] [INFO] 触发限额剔除规则，执行物理剔除...")
+            requests.delete(
+                _normalize_cpa_auth_files_url(cfg.CPA_API_URL),
+                headers={"Authorization": f"Bearer {cfg.CPA_API_TOKEN}"},
+                params={"name": name},
+            )
+        elif not is_disabled:
+            print(f"[{ts()}] [INFO] 测活: 凭证额度耗尽，正在禁用...")
+            ok = set_cpa_auth_file_status(cfg.CPA_API_URL, cfg.CPA_API_TOKEN, name, disabled=True)
+            print(
+                f"[{ts()}] [{'SUCCESS' if ok else 'ERROR'}] "
+                f"测活: 凭证 {mask_email(name)} {'已成功禁用，等待额度重置。' if ok else '禁用失败！'}"
+            )
+        else:
+            print(f"[{ts()}] [INFO] 测活: 账号额度尚未恢复，继续保持禁用状态。")
+        return False
+
+    if not cfg.ENABLE_TOKEN_REVIVE:
+        print(f"[{ts()}] [INFO] 检测到 Token 已失效，但【复活】已关闭，仅记录状态。")
+        _handle_dead_account(name, is_disabled)
+        return False
+
+    print(f"[{ts()}] [INFO] 测活: 凭证 {mask_email(name)} 准备尝试刷新 Token 复活...")
+    refresh_success = False
+
+    if item.get("runtime_only") or item.get("source") == "memory":
+        print(f"[{ts()}] [WARNING] {mask_email(name)} 属于纯内存凭据，跳过抢救。")
+        full_item_data: dict = {}
+    else:
+        try:
+            dl_url = f"{_normalize_cpa_auth_files_url(cfg.CPA_API_URL)}/download"
+            content_resp = requests.get(
+                dl_url, params={"name": name},
+                headers={"Authorization": f"Bearer {cfg.CPA_API_TOKEN}"},
+                timeout=20,
+            )
+            full_item_data = content_resp.json() if content_resp.status_code == 200 else {}
+            if content_resp.status_code != 200:
+                print(f"[{ts()}] [ERROR] 获取 {mask_email(name)} 完整内容失败 "
+                      f"(HTTP {content_resp.status_code})")
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] 获取 {mask_email(name)} 完整内容异常: {e}")
+            full_item_data = {}
+
+    refresh_token_val = full_item_data.get("refresh_token")
+    if refresh_token_val:
+        proxies = {"http": args.proxy, "https": args.proxy} if args.proxy else None
+        ok, new_tokens = refresh_oauth_token(refresh_token_val, proxies=proxies)
+        if ok:
+            print(f"[{ts()}] [INFO] {mask_email(name)} Token 刷新成功，正在同步至CPA...")
+            full_item_data.update(new_tokens)
+            if "email" not in full_item_data:
+                full_item_data["email"] = name.replace(".json", "")
+            up_ok, up_msg = upload_to_cpa_integrated(
+                full_item_data, cfg.CPA_API_URL, cfg.CPA_API_TOKEN, custom_filename=name
+            )
+            if up_ok:
+                time.sleep(3)
+                is_ok2, msg2 = test_cliproxy_auth_file(item, cfg.CPA_API_URL, cfg.CPA_API_TOKEN)
+                if is_ok2:
+                    refresh_success = True
+                    print(f"[{ts()}] [SUCCESS] 测活: {mask_email(name)} 刷新后复活成功！")
+                else:
+                    print(f"[{ts()}] [WARNING] {mask_email(name)} 刷新后二次测活依然失败({msg2})")
+            else:
+                print(f"[{ts()}] [ERROR] 刷新后覆盖CPA失败: {up_msg}")
+        else:
+            print(f"[{ts()}] [WARNING] {mask_email(name)} Token 复活请求被拒绝: "
+                  f"{new_tokens.get('error','未知错误')}")
+    else:
+        print(f"[{ts()}] [WARNING] {mask_email(name)} 未找到有效数据，无法抢救")
+
+    if not refresh_success:
+        _handle_dead_account(name, is_disabled)
+    return refresh_success
+
+
+def _handle_dead_account(name: str, is_disabled: bool) -> None:
+    """统一处理彻底死亡账号（删除或禁用）。"""
+    if cfg.REMOVE_DEAD_ACCOUNTS:
+        print(f"[{ts()}] [WARNING] 凭证 {mask_email(name)} 彻底死亡，执行物理剔除...")
+        requests.delete(
+            _normalize_cpa_auth_files_url(cfg.CPA_API_URL),
+            headers={"Authorization": f"Bearer {cfg.CPA_API_TOKEN}"},
+            params={"name": name},
+        )
+    elif not is_disabled:
+        print(f"[{ts()}] [INFO] 凭证 {mask_email(name)} 死亡，根据配置保留，正在禁用...")
+        if set_cpa_auth_file_status(cfg.CPA_API_URL, cfg.CPA_API_TOKEN, name, disabled=True):
+            print(f"[{ts()}] [SUCCESS] 死亡凭证 {mask_email(name)} 已成功禁用。")
+    else:
+        print(f"[{ts()}] [WARNING] 凭证 {mask_email(name)} 已死亡，当前已是禁用状态，根据配置保留不删除。")
+
+def handle_registration_result(result: Any, cpa_upload: bool = False) -> str:
+    global run_stats
+    last_email = mail_service.LAST_ATTEMPT_EMAIL
+    cur_dom = last_email.split("@")[-1] if last_email and "@" in last_email else None
+
+    if not result or result[0] is None:
+        run_stats["failed"] += 1
+
+        if cfg.ENABLE_SUB_DOMAINS and cur_dom:
+            with _heal_lock:
+                sub_fail_counts[cur_dom] = sub_fail_counts.get(cur_dom, 0) + 1
+                fails = sub_fail_counts[cur_dom]
+
+            if fails >= cfg.SUB_DOMAIN_FAIL_THRESHOLD:
+                auto_heal_subdomain(cur_dom)
+                with _heal_lock: sub_fail_counts[cur_dom] = 0 
+            else:
+                print(f"[{ts()}] [DEBUG] 域名 {mask_email(cur_dom)} 失败计数 ({fails}/{cfg.SUB_DOMAIN_FAIL_THRESHOLD})")
+        return "failed"
+
+    if cur_dom:
+        with _heal_lock: sub_fail_counts[cur_dom] = 0
+
+    token_json_str, password = result
+    if not token_json_str:
+        run_stats["failed"] += 1
+        return "failed"
+    if token_json_str == "retry_403":
+        run_stats["retries"] += 1
+        print(f"[{ts()}] [WARNING] 检测到 403 频率限制，挂起重试...")
+        return "retry_403"
+
+    run_stats["success"] += 1
+    token_data    = json.loads(token_json_str)
+    account_email = token_data.get("email", "unknown")
+
+    # 存入数据库
+    if (cpa_upload and cfg.SAVE_TO_LOCAL_IN_CPA_MODE) or not cpa_upload:
+        if db_manager.save_account_to_db(account_email, password, token_json_str):
+            print(f"[{ts()}] [SUCCESS] 账号密码与 Token 已安全存入: {mask_email(account_email)}")
+
+    # CPA 云端上传
+    if cpa_upload:
+        success, up_msg = upload_to_cpa_integrated(token_data, cfg.CPA_API_URL, cfg.CPA_API_TOKEN)
+        if success:
+            print(f"[{ts()}] [SUCCESS] 补货凭证 {mask_email(account_email)} 云端上传成功！")
+        else:
+            print(f"[{ts()}] [ERROR] 云端上传失败: {up_msg}")
+
+    return "success"
+
+def run_and_refresh(proxy, args, cpa_upload=False, skip_switch=False):
+    proxy = format_docker_url(proxy)
+    """切节点 → 注册 → 处理结果。"""
+    if not skip_switch:
+        if not smart_switch_node(proxy):
+            print(f"[{ts()}] [WARNING] {proxy} 节点切换失败，将使用当前 IP 继续尝试...")
+    result = run(proxy)
+    return handle_registration_result(result, cpa_upload=cpa_upload)
+
+def auto_heal_subdomain(failed_domain: str):
+    print(f"[{ts()}] [自愈] 域名 {failed_domain} 达到失败阈值，触发更替程序...")
+    import wfxl_openai_regst 
+    cf_cfg = getattr(cfg, '_c', {})
+    api_email = cf_cfg.get("cf_api_email")
+    api_key = cf_cfg.get("cf_api_key")
+    main_dom = failed_domain.split(".", 1)[1]
+
+    try:
+        from cloudflare import Cloudflare
+        cf = Cloudflare(api_email=api_email, api_key=api_key)
+        zones = cf.zones.list(name=main_dom)
+        if zones.result:
+            zone_id = zones.result[0].id
+            url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/email/routing/dns"
+            headers = {"X-Auth-Email": api_email, "X-Auth-Key": api_key, "Content-Type": "application/json"}
+            payload = json.dumps({"name": failed_domain}).encode('utf-8')
+            requests.delete(url, data=payload, headers=headers, impersonate="chrome110")
+            wfxl_openai_regst.dispatch_email_backend_delete(failed_domain, cf_cfg)
+            print(f"[{ts()}] [自愈] 已成功注销失效域名: {mask_email(failed_domain)}")
+    except Exception as e:
+        print(f"[{ts()}] [ERROR] 销毁失效域名异常: {e}")
+
+    refill_num = int(getattr(cfg, 'SUB_DOMAIN_REFILL_COUNT', 1))
+    new_domains = []
+    for _ in range(refill_num):
+        prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
+        new_domains.append(f"{prefix}.{main_dom}")
+
+    with _heal_lock:
+        current_list = [d.strip() for d in cfg.SUB_DOMAINS_LIST.split(",") if d.strip()]
+        if failed_domain in current_list:
+            current_list.remove(failed_domain)
+        current_list.extend(new_domains)
+        
+        config_path = "config.yaml"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                y = yaml.safe_load(f) or {}
+            y["sub_domains_list"] = ",".join(current_list)
+            y["sub_domain_fail_threshold"] = cfg.SUB_DOMAIN_FAIL_THRESHOLD
+            y["sub_domain_refill_count"] = cfg.SUB_DOMAIN_REFILL_COUNT
+            
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.dump(y, f, allow_unicode=True, sort_keys=False)
+            reload_all_configs()
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] 自愈配置保存失败: {e}")
+
+    for ns in new_domains:
+        try:
+            cf.email_routing.dns.create(zone_id=zone_id, name=ns)
+            wfxl_openai_regst.dispatch_email_backend_add(ns, cf_cfg)
+            print(f"[{ts()}] [自愈] 已补货新域名 {ns}，等待生效...")
+        except: pass
+
+    print(f"[{ts()}] [自愈] 正在进入状态监控，等待 Cloudflare 激活路由...")
+    retry_count = 0
+    while True:
+        try:
+            info = cf.email_routing.get(zone_id=zone_id)
+            res_data = getattr(info, 'result', info)
+            status = getattr(res_data, 'status', 'unknown')
+            synced = getattr(res_data, 'synced', False)
+
+            retry_count += 1
+            if retry_count % 4 == 0:
+                print(f"[{ts()}] [监控] (等待中...)")
+
+            if status == 'ready':
+                if synced is True or retry_count > 20: 
+                    print(f"[{ts()}] [SUCCESS] 域名池状态确认完成，准备恢复业务线程。")
+                    break
+                    
+        except Exception as e:
+            print(f"[{ts()}] [WARNING] 状态监控请求异常 (重试中): {e}")
+            
+        time.sleep(15)
+
+def _handle_sub2api_dead_account(item: dict, client: Any, is_disabled: bool) -> None:
+    """统一处理 Sub2API 彻底死亡账号（删除或禁用）"""
+    name = item.get("name", "unknown")
+    account_id = item.get("id") 
+
+    if cfg.SUB2API_REMOVE_DEAD_ACCOUNTS:
+        print(f"[{ts()}] [WARNING] 凭证 {mask_email(name)} 彻底死亡，执行物理剔除...")
+        if hasattr(client, "delete_account") and account_id:
+            client.delete_account(account_id) 
+    elif not is_disabled:
+        print(f"[{ts()}] [INFO] 凭证 {mask_email(name)} 死亡，根据配置保留，正在禁用...")
+        if hasattr(client, "set_account_status") and account_id:
+            client.set_account_status(account_id, disabled=True)
+    else:
+        print(f"[{ts()}] [WARNING] 凭证 {mask_email(name)} 已死亡，当前已是禁用状态，根据配置保留不删除。")
+
+def process_sub2api_worker(i: int, total: int, item: dict, client: Any, args: Any) -> bool:
+    """专属 Sub2API 的测活 Worker"""
+    if hasattr(args, 'check_stop') and args.check_stop(): return False
+    name = item.get("name", "unknown")
+    account_id = item.get("id")
+    is_disabled = item.get("status") != "active" 
+    
+    is_ok, msg = test_sub2api_account_direct(item, args.proxy)
+    if is_ok:
+        if is_disabled:
+            print(f"[{ts()}] [INFO] Sub2API测活: {mask_email(name)} 额度已恢复且有效，准备启用...")
+            if hasattr(client, "set_account_status") and account_id:
+                ok = client.set_account_status(account_id, disabled=False)
+                print(f"[{ts()}] [{'SUCCESS' if ok else 'ERROR'}] 凭证 {mask_email(name)} {'已成功启用！' if ok else '启用失败。'}")
+            return True
+        print(f"[{ts()}] [INFO] Sub2API测活: {mask_email(name)} 状态健康 ({msg})")
+        return True
+
+    print(f"[{ts()}] [WARNING] Sub2API测活: 凭证 {mask_email(name)} 失效，原因: {msg}")
+
+    if "周限额" in msg or "usage_limit_reached" in msg or "低于阈值" in msg:
+        if cfg.SUB2API_REMOVE_ON_LIMIT_REACHED:
+            print(f"[{ts()}] [INFO] 真实测活触发限额剔除规则，执行物理剔除...")
+            if hasattr(client, "delete_account") and account_id:
+                client.delete_account(account_id)
+        elif not is_disabled:
+            print(f"[{ts()}] [INFO] 真实测活显示额度耗尽，正在禁用...")
+            if hasattr(client, "set_account_status") and account_id:
+                client.set_account_status(account_id, disabled=True)
+        else:
+            print(f"[{ts()}] [INFO] 测活: 账号额度尚未恢复，继续保持禁用状态。")
+        return False
+
+    if not cfg.SUB2API_ENABLE_TOKEN_REVIVE:
+        print(f"[{ts()}] [INFO] 检测到 Token 已失效，但【复活】已关闭，仅记录状态。")
+        _handle_sub2api_dead_account(item, client, is_disabled)
+        return False
+
+    print(f"[{ts()}] [INFO] 测活: 凭证 {mask_email(name)} 准备尝试刷新 Token 复活...")
+    refresh_success = False
+    refresh_token_val = item.get("credentials", {}).get("refresh_token")
+    
+    if refresh_token_val:
+        proxies = {"http": args.proxy, "https": args.proxy} if args.proxy else None
+        ok, new_tokens = refresh_oauth_token(refresh_token_val, proxies=proxies)
+        
+        if ok:
+            print(f"[{ts()}] [INFO] {mask_email(name)} Token 刷新成功，正在同步至 Sub2API...")
+            item.setdefault("credentials", {}).update(new_tokens)
+            
+            if hasattr(client, "update_account"):
+                up_ok, up_msg = client.update_account(item)
+                if up_ok:
+                    refresh_success = True
+                    print(f"[{ts()}] [SUCCESS] 测活: {mask_email(name)} 刷新后复活成功！")
+                else:
+                    print(f"[{ts()}] [ERROR] 刷新后覆盖 Sub2API 失败: {up_msg}")
+            else:
+                print(f"[{ts()}] [WARNING] 刷新成功，但缺少 update_account 接口方法")
+                refresh_success = True 
+        else:
+            print(f"[{ts()}] [WARNING] {mask_email(name)} Token 复活请求被拒绝: {new_tokens.get('error','未知')}")
+    else:
+        print(f"[{ts()}] [WARNING] {mask_email(name)} 未找到有效 refresh_token，无法抢救")
+
+    if not refresh_success:
+        _handle_sub2api_dead_account(item, client, is_disabled)
+        
+    return refresh_success
+
+
+def normal_main_loop(args, stop_event: threading.Event):
+    """常规量产模式（纯数据库保存）"""
+    sleep_min    = max(1, cfg.NORMAL_SLEEP_MIN)
+    sleep_max    = max(sleep_min, cfg.NORMAL_SLEEP_MAX)
+    target_count = cfg.NORMAL_TARGET_COUNT
+
+    print(f"\n[{ts()}] >>> 启动常规量产模式 <<<")
+    if target_count > 0:
+        print(f"[{ts()}] 任务目标: 注册 {target_count} 个账号后自动停止")
+    else:
+        print(f"[{ts()}] 任务目标: 无限挂机注册 (按 Ctrl+C 停止)")
+
+    success_count  = 0
+    total_attempts = 0
+
+    while not stop_event.is_set():
+        if target_count > 0 and success_count >= target_count:
+            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
+            break
+
+        total_attempts += 1
+        print(f"\n[{ts()}] --- 开始第 {total_attempts} 次注册 (已成功: {success_count}) ---")
+        if stop_event.wait(1.0):
+            break
+
+        try:
+            if cfg._clash_enable and not cfg._clash_pool_mode:
+                print(f"[{ts()}] [INFO] 触发单端口共享模式，正在进行全局节点切换...")
+                if not smart_switch_node(args.proxy):
+                    print(f"[{ts()}] [WARNING] 全局节点切换失败，将使用当前 IP 继续尝试...")
+
+            if cfg.ENABLE_MULTI_THREAD_REG:
+                current_batch = (
+                    min(cfg.REG_THREADS, target_count - success_count)
+                    if target_count > 0 else cfg.REG_THREADS
+                )
+                print(f"[{ts()}] [INFO] 启用多线程并发 ({current_batch} 条通道)")
+
+                def _worker():
+                    if stop_event.is_set(): return "stopped"
+                    if cfg._clash_enable and cfg._clash_pool_mode:
+                        p = cfg.PROXY_QUEUE.get()
+                        try:
+                            return run_and_refresh(p, args, False, skip_switch=False)
+                        finally:
+                            cfg.PROXY_QUEUE.put(p)
+                            cfg.PROXY_QUEUE.task_done()
+                    return run_and_refresh(args.proxy, args, False, skip_switch=True)
+
+                with ThreadPoolExecutor(max_workers=current_batch) as ex:
+                    futures = [ex.submit(_worker) for _ in range(current_batch)]
+                    for f in futures:
+                        if f.result() == "success":
+                            success_count += 1
+            else:
+                if cfg._clash_enable and cfg._clash_pool_mode:
+                    p = cfg.PROXY_QUEUE.get()
+                    try:
+                        status = run_and_refresh(p, args, False, skip_switch=False)
+                    finally:
+                        cfg.PROXY_QUEUE.put(p)
+                        cfg.PROXY_QUEUE.task_done()
+                else:
+                    status = run_and_refresh(args.proxy, args, False, skip_switch=True)
+
+                if status == "success":
+                    success_count += 1
+
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] 发生未捕获全局异常: {e}")
+
+        if target_count > 0 and success_count >= target_count:
+            print(f"\n[{ts()}] [SUCCESS] 已达到目标注册数量 ({target_count})，任务圆满结束！")
+            break
+
+        if args.once:
+            break
+
+        wait_time = random.randint(sleep_min, sleep_max)
+        print(f"[{ts()}] [INFO] 缓冲防风控，等待 {wait_time} 秒后继续...")
+        if stop_event.wait(wait_time):
+            break
+
+
+async def cpa_main_loop(args, async_stop_event: asyncio.Event):
+    """CPA 智能仓管模式（接入发牌器，防止撞车）。"""
+    print("=" * 60)
+    print(f"   目标库存阈值: {cfg.MIN_ACCOUNTS_THRESHOLD} | 单次补发量: {cfg.BATCH_REG_COUNT}")
+    print(
+        f"   周限额剔除规则: 剩余低于 {cfg.MIN_REMAINING_WEEKLY_PERCENT}%"
+        if cfg.MIN_REMAINING_WEEKLY_PERCENT > 0
+        else "   周限额剔除规则: 完全耗尽才剔除"
+    )
+    print("=" * 60)
+
+    loop = asyncio.get_running_loop()
+
+    while not async_stop_event.is_set():
+        print(f"\n[{ts()}] [INFO] 开始执行仓库例行巡检与测活...")
+        try:
+            res = requests.get(
+                _normalize_cpa_auth_files_url(cfg.CPA_API_URL),
+                headers={"Authorization": f"Bearer {cfg.CPA_API_TOKEN}"},
+                timeout=20,
+            )
+            all_files    = res.json().get("files", [])
+            codex_files  = [
+                f for f in all_files
+                if "codex" in str(f.get("type", "")).lower()
+                or "codex" in str(f.get("provider", "")).lower()
+            ]
+            total_files = len(codex_files)
+
+            with ThreadPoolExecutor(max_workers=cfg.CPA_THREADS) as executor:
+                futures = [
+                    loop.run_in_executor(executor, process_account_worker, i, total_files, item, args)
+                    for i, item in enumerate(codex_files, 1)
+                ]
+                results = await asyncio.gather(*futures)
+
+            valid_count = sum(1 for r in results if r)
+            print(f"[{ts()}] [INFO] 巡检结束，当前仓库有效数: {valid_count}")
+
+            if valid_count < cfg.MIN_ACCOUNTS_THRESHOLD:
+                need_to_reg          = cfg.BATCH_REG_COUNT
+                global run_stats
+                run_stats["target"] += need_to_reg
+                success_in_this_cycle = 0
+                print(f"[{ts()}] [INFO] 库存不足 ({valid_count} < {cfg.MIN_ACCOUNTS_THRESHOLD})，启动补货...")
+                await asyncio.sleep(1)
+
+                def _cpa_worker():
+                    if async_stop_event.is_set(): return "stopped"
+                    if cfg._clash_enable and cfg._clash_pool_mode:
+                        p = cfg.PROXY_QUEUE.get()
+                        try:
+                            return run_and_refresh(p, args, cpa_upload=True, skip_switch=False)
+                        finally:
+                            cfg.PROXY_QUEUE.put(p)
+                            cfg.PROXY_QUEUE.task_done()
+                    return run_and_refresh(args.proxy, args, cpa_upload=True, skip_switch=True)
+
+                while success_in_this_cycle < need_to_reg and not async_stop_event.is_set():
+                    remaining  = need_to_reg - success_in_this_cycle
+                    batch_size = min(cfg.REG_THREADS, remaining)
+
+                    if cfg._clash_enable and not cfg._clash_pool_mode:
+                        print(f"[{ts()}] [INFO] [CPA补货] 切换全局节点...")
+                        if not smart_switch_node(args.proxy):
+                            print(f"[{ts()}] [WARNING] [CPA补货] 全局节点切换失败，使用当前 IP 继续...")
+
+                    if cfg.ENABLE_MULTI_THREAD_REG:
+                        print(f"[{ts()}] [INFO] 多线程补货: {success_in_this_cycle}/{need_to_reg} "
+                              f"({batch_size} 线程)")
+                        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                            reg_futures = [
+                                loop.run_in_executor(ex, _cpa_worker)
+                                for _ in range(batch_size)
+                            ]
+                            reg_results = await asyncio.gather(*reg_futures)
+                        for status in reg_results:
+                            if status == "success":
+                                success_in_this_cycle += 1
+                            elif status == "retry_403":
+                                print(f"[{ts()}] [WARNING] 遇到 403 频率限制，给服务器 15 秒冷却时间...")
+                                await asyncio.sleep(15)
+                    else:
+                        print(f"[{ts()}] [INFO] 单线程补货: {success_in_this_cycle}/{need_to_reg}")
+                        if cfg._clash_enable and cfg._clash_pool_mode:
+                            p = cfg.PROXY_QUEUE.get()
+                            try:
+                                status = await loop.run_in_executor(None, run_and_refresh, p, args, True, False)
+                            finally:
+                                cfg.PROXY_QUEUE.put(p)
+                                cfg.PROXY_QUEUE.task_done()
+                        else:
+                            status = await loop.run_in_executor(
+                                None, run_and_refresh, args.proxy, args, True, True
+                            )
+                        if status == "success":
+                            success_in_this_cycle += 1
+                        elif status == "retry_403":
+                            await asyncio.sleep(10)
+                        await asyncio.sleep(5)
+
+                print(f"[{ts()}] [SUCCESS] 本轮补货完成！累计入库: {success_in_this_cycle} 个。")
+            else:
+                print(f"[{ts()}] [INFO] 仓库存量充足，无需补发。")
+
+            print(f"[{ts()}] [INFO] 维护周期结束，{cfg.CHECK_INTERVAL_MINUTES} 分钟后进行下一次巡检...")
+            try:
+                await asyncio.wait_for(
+                    async_stop_event.wait(),
+                    timeout=cfg.CHECK_INTERVAL_MINUTES * 60,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] 主循环异常: {e}")
+            try:
+                await asyncio.wait_for(async_stop_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
+
+async def sub2api_main_loop(args, async_stop_event: asyncio.Event):
+    """Sub2API 智能仓管模式"""
+    print("=" * 60)
+    print(f"   Sub2API 目标库存阈值: {cfg.SUB2API_MIN_THRESHOLD} | 单次补发量: {cfg.SUB2API_BATCH_COUNT}")
+    print(
+        f"   周限额剔除规则: 剩余低于 {cfg.SUB2API_MIN_REMAINING_WEEKLY_PERCENT}%"
+        if cfg.SUB2API_MIN_REMAINING_WEEKLY_PERCENT > 0
+        else "   周限额剔除规则: 完全耗尽才剔除"
+    )
+    print("=" * 60)
+
+    loop = asyncio.get_running_loop()
+    client = Sub2APIClient(api_url=cfg.SUB2API_URL, api_key=cfg.SUB2API_KEY)
+
+    while not async_stop_event.is_set():
+        print(f"\n[{ts()}] [INFO] 开始执行 Sub2API 仓库例行巡检与测活...")
+        try:
+            success, data = client.get_accounts(page=1, page_size=1000)
+            if not success:
+                print(f"[{ts()}] [ERROR] 获取 Sub2API 库存失败: {data}")
+                try: await asyncio.wait_for(async_stop_event.wait(), timeout=60)
+                except asyncio.TimeoutError: pass
+                continue
+
+            account_list = data.get("data", {}).get("items", [])
+            total_files = len(account_list)
+
+            with ThreadPoolExecutor(max_workers=cfg.SUB2API_THREADS) as executor:
+                futures = [
+                    loop.run_in_executor(executor, process_sub2api_worker, i, total_files, item, client, args)
+                    for i, item in enumerate(account_list, 1)
+                ]
+                results = await asyncio.gather(*futures)
+
+            valid_count = sum(1 for r in results if r)
+            print(f"[{ts()}] [INFO] 巡检结束，当前 Sub2API 仓库有效数: {valid_count}")
+
+            if valid_count < cfg.SUB2API_MIN_THRESHOLD:
+                need_to_reg          = cfg.SUB2API_BATCH_COUNT
+                global run_stats
+                run_stats["target"] += need_to_reg
+                success_in_this_cycle = 0
+                print(f"[{ts()}] [INFO] 库存不足 ({valid_count} < {cfg.SUB2API_MIN_THRESHOLD})，启动补货...")
+                await asyncio.sleep(1)
+
+                def _sub2api_run_wrapper(p, skip_switch):
+                    p = format_docker_url(p)
+                    if not skip_switch:
+                        if not smart_switch_node(p):
+                            print(f"[{ts()}] [WARNING] [Sub2API补货] 全局节点切换失败...")
+                    
+                    result = run(p)
+                    status = handle_registration_result(result, cpa_upload=False)
+                    
+                    if status == "success":
+                        token_dict = json.loads(result[0])
+                        if hasattr(client, "add_account"):
+                            ok, msg = client.add_account(token_dict)
+                            if ok: print(f"[{ts()}] [SUCCESS] Sub2API 补货入库成功")
+                            else: print(f"[{ts()}] [ERROR] Sub2API 补货入库失败: {msg}")
+                    return status
+
+                def _sub2api_worker():
+                    if async_stop_event.is_set(): return "stopped"
+                    if cfg._clash_enable and cfg._clash_pool_mode:
+                        p = cfg.PROXY_QUEUE.get()
+                        try:
+                            return _sub2api_run_wrapper(p, False)
+                        finally:
+                            cfg.PROXY_QUEUE.put(p)
+                            cfg.PROXY_QUEUE.task_done()
+                    return _sub2api_run_wrapper(args.proxy, True)
+
+                while success_in_this_cycle < need_to_reg and not async_stop_event.is_set():
+                    remaining  = need_to_reg - success_in_this_cycle
+                    batch_size = min(cfg.REG_THREADS, remaining)
+
+                    if cfg._clash_enable and not cfg._clash_pool_mode:
+                        print(f"[{ts()}] [INFO] [Sub2API补货] 切换全局节点...")
+                        if not smart_switch_node(args.proxy):
+                            print(f"[{ts()}] [WARNING] [Sub2API补货] 全局节点切换失败，使用当前 IP 继续...")
+
+                    if cfg.ENABLE_MULTI_THREAD_REG:
+                        print(f"[{ts()}] [INFO] 多线程补货: {success_in_this_cycle}/{need_to_reg} "
+                              f"({batch_size} 线程)")
+                        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+                            reg_futures = [
+                                loop.run_in_executor(ex, _sub2api_worker)
+                                for _ in range(batch_size)
+                            ]
+                            reg_results = await asyncio.gather(*reg_futures)
+                            
+                        for status in reg_results:
+                            if status == "success":
+                                success_in_this_cycle += 1
+                            elif status == "retry_403":
+                                print(f"[{ts()}] [WARNING] 遇到 403 频率限制，给服务器 15 秒冷却时间...")
+                                try: await asyncio.wait_for(async_stop_event.wait(), timeout=15)
+                                except asyncio.TimeoutError: pass
+                                
+                    else:
+                        print(f"[{ts()}] [INFO] 单线程补货: {success_in_this_cycle}/{need_to_reg}")
+                        if cfg._clash_enable and cfg._clash_pool_mode:
+                            p = cfg.PROXY_QUEUE.get()
+                            try:
+                                status = await loop.run_in_executor(None, _sub2api_run_wrapper, p, False)
+                            finally:
+                                cfg.PROXY_QUEUE.put(p)
+                                cfg.PROXY_QUEUE.task_done()
+                        else:
+                            status = await loop.run_in_executor(
+                                None, _sub2api_run_wrapper, args.proxy, True
+                            )
+                            
+                        if status == "success":
+                            success_in_this_cycle += 1
+                        elif status == "retry_403":
+                            try: await asyncio.wait_for(async_stop_event.wait(), timeout=10)
+                            except asyncio.TimeoutError: pass
+                            
+                        try: await asyncio.wait_for(async_stop_event.wait(), timeout=5)
+                        except asyncio.TimeoutError: pass
+
+                print(f"[{ts()}] [SUCCESS] 本轮补货完成！累计入库 Sub2API: {success_in_this_cycle} 个。")
+            else:
+                print(f"[{ts()}] [INFO] 仓库存量充足，无需补发。")
+
+            print(f"[{ts()}] [INFO] 维护周期结束，{cfg.SUB2API_CHECK_INTERVAL} 分钟后进行下一次巡检...")
+            try:
+                await asyncio.wait_for(
+                    async_stop_event.wait(),
+                    timeout=cfg.SUB2API_CHECK_INTERVAL * 60,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] Sub2API 循环发生致命异常: {e}")
+            print(f"[{ts()}] [INFO] 触发安全保护，系统已自动停止运行。")
+            async_stop_event.set()
+            break
+
+
+def main() -> None:
+    reload_all_configs()
+    parser = argparse.ArgumentParser(description="OpenAI 自动注册 & CPA 检测一体")
+    parser.add_argument("--proxy", default=None, help="代理地址")
+    # parser.add_argument("--once", action="store_true", help="只运行一次")
+    args       = parser.parse_args()
+    args.proxy = cfg.DEFAULT_PROXY if cfg.DEFAULT_PROXY.strip() else None
+
+    if cfg.ENABLE_CPA_MODE:
+        print("   当前状态: [ CPA 智能仓管模式 ] 已开启")
+    else:
+        print("   当前状态: [ 常规量产模式 ] 已开启")
+    print("=" * 65)
+
+    if cfg.ENABLE_CPA_MODE:
+        try:
+            asyncio.run(cpa_main_loop(args, asyncio.Event()))
+        except KeyboardInterrupt:
+            print(f"\n[{ts()}] [INFO] 用户终止了系统运行。")
+    else:
+        stop_event = threading.Event()
+        try:
+            normal_main_loop(args, stop_event)
+        except KeyboardInterrupt:
+            print(f"\n[{ts()}] [INFO] 用户终止了系统运行。")
+
+
+class RegEngine:
+    """GUI 用控制类，封装线程/协程生命周期。"""
+
+    def __init__(self):
+        self.thread_stop_event = threading.Event()
+        self.async_stop_event  = None
+        self.current_thread    = None
+        self.loop              = None
+        self._force_stopped    = False
+
+    def start_normal(self, args):
+        if self.is_running():
+            return
+        self.thread_stop_event.clear()
+        args.check_stop = lambda: self.thread_stop_event.is_set()
+        self.current_thread = threading.Thread(
+            target=normal_main_loop,
+            args=(args, self.thread_stop_event),
+            daemon=True,
+        )
+        self.current_thread.start()
+
+    def start_cpa(self, args):
+        if self.is_running():
+            return
+        self.thread_stop_event.clear()
+        self.current_thread = threading.Thread(
+            target=self._run_cpa_in_thread, args=(args,), daemon=True
+        )
+        self.current_thread.start()
+        
+    def start_sub2api(self, args):
+        if self.is_running():
+            return
+        self.thread_stop_event.clear()
+        self.current_thread = threading.Thread(
+            target=self._run_sub2api_in_thread, args=(args,), daemon=True
+        )
+        self.current_thread.start()
+
+    def _run_cpa_in_thread(self, args):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._cpa_wrapper(args))
+        finally:
+            self.loop.close()
+
+    def _run_sub2api_in_thread(self, args):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.async_stop_event = asyncio.Event()
+            self.loop.run_until_complete(sub2api_main_loop(args, self.async_stop_event))
+        finally:
+            self.loop.close()
+            
+    async def _cpa_wrapper(self, args):
+        self.async_stop_event = asyncio.Event()
+        await cpa_main_loop(args, self.async_stop_event)
+
+    def stop(self):
+        self._force_stopped = True
+        self.thread_stop_event.set()
+        if self.loop and self.async_stop_event:
+            self.loop.call_soon_threadsafe(self.async_stop_event.set)
+
+    def is_running(self) -> bool:
+        if self._force_stopped:
+            return False
+        return self.current_thread is not None and self.current_thread.is_alive()
+
+
+if __name__ == "__main__":
+    main()
