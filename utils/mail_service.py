@@ -20,7 +20,7 @@ from utils import config as cfg
 
 
 _CM_TOKEN_CACHE: Optional[str] = None
-_FREEMAIL_COOKIE_CACHE = {}
+
 _thread_data = threading.local()
 _orig_sleep = time.sleep
 
@@ -84,32 +84,6 @@ def get_cm_token(proxies=None) -> Optional[str]:
         print(f"[{cfg.ts()}] [ERROR] CloudMail 接口请求异常: {e}")
     return None
 
-def _get_fm_cookie(fm_url: str, fm_user: str, fm_pass: str, proxies: Any = None) -> str:
-    """为自动登录获取专属 mailfree"""
-    cache_key = f"{fm_url}_{fm_user}_{fm_pass}"
-    if cache_key in _FREEMAIL_COOKIE_CACHE:
-        return _FREEMAIL_COOKIE_CACHE[cache_key]
-    try:
-        login_url = f"{fm_url.rstrip('/')}/api/login"
-        res = requests.post(
-            login_url,
-            json={"username": fm_user, "password": fm_pass},
-            proxies=proxies, timeout=15, impersonate="chrome110"
-        )
-        if res.status_code == 200:
-            c_val = ""
-            for k, v in res.cookies.items():
-                if k == "mailfree-session": c_val = f"{k}={v}"
-            if not c_val:
-                for k, v in res.headers.items():
-                    if k.lower() == 'set-cookie' and 'mailfree-session=' in v:
-                        c_val = [p.strip() for p in v.split(';') if p.strip().startswith('mailfree-session=')][0]
-            if c_val:
-                _FREEMAIL_COOKIE_CACHE[cache_key] = c_val
-                return c_val
-    except Exception: pass
-    return ""
-
 def get_email_and_token(proxies: Any = None) -> tuple:
     """兼容五种邮箱模式的地址创建，返回 (email, token_or_id)。"""
     if getattr(cfg, 'GLOBAL_STOP', False): return None, None
@@ -162,61 +136,33 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         return None, None
 
     if mode == "freemail":
-        headers = {"Content-Type": "application/json"}
-        _free = getattr(cfg, '_c', {}).get("freemail", {})
-        fm_user = _free.get("admin_username", "admin")
-        fm_pass = _free.get("admin_password", "")
-        if cfg.ENABLE_SUB_DOMAINS:
-            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            cookie = _get_fm_cookie(cfg.FREEMAIL_API_URL, fm_user, fm_pass, mail_proxies)
-            if cookie: headers["Cookie"] = cookie
-            elif cfg.FREEMAIL_API_TOKEN: headers["Authorization"] = f"Bearer {cfg.FREEMAIL_API_TOKEN}"
-        else:
-            if cfg.FREEMAIL_API_TOKEN: headers["Authorization"] = f"Bearer {cfg.FREEMAIL_API_TOKEN}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.FREEMAIL_API_TOKEN}"
+        }
+        pool = getattr(cfg, 'SUB_DOMAINS_LIST', '') if cfg.ENABLE_SUB_DOMAINS else cfg.MAIL_DOMAINS
+        domain_list = [d.strip() for d in pool.split(",") if d.strip()]
+        
+        if not domain_list:
+            print(f"[{cfg.ts()}] [ERROR] Freemail 域名池为空！请检查配置。")
+            return None, None
             
-        api_params: dict = {}
-        try:
-            req_func = lambda url, h: requests.get(url, headers=h, proxies=mail_proxies, verify=_ssl_verify(), timeout=15, 
-                                                   impersonate="chrome110" if cfg.ENABLE_SUB_DOMAINS else None)
-            domain_res = req_func(f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/domains", headers)
-            raw_text = domain_res.text.strip()
-            
-            if raw_text.upper() == "OK" or not raw_text.startswith("["):
-                api_params["domainIndex"] = 0
-            else:
-                domains_list = domain_res.json()
-                if isinstance(domains_list, list) and domains_list:
-                    if cfg.ENABLE_SUB_DOMAINS:
-                        allowed_pool = [d.strip().lower() for d in getattr(cfg, 'SUB_DOMAINS_LIST', '').split(",") if d.strip()]
-                        valid_indices = [idx for idx, dom in enumerate(domains_list) if str(dom).strip().lower() in allowed_pool]
-                        
-                        if valid_indices:
-                            api_params["domainIndex"] = random.choice(valid_indices)
-                        else:
-                            print(f"[{cfg.ts()}] [ERROR] 远程 Freemail 列表未包含你配置的二级域名！请检查同步状态。")
-                            return None, None
-                    else:
-                        api_params["domainIndex"] = random.randint(0, len(domains_list) - 1)
-        except Exception as e:
-            print(f"[{cfg.ts()}] [WARNING] 探测 Freemail 域名列表时异常: {e}")
-
+        selected_domain = random.choice(domain_list)
+        email_str = f"{prefix}@{selected_domain}"
+        
         for attempt in range(5):
             if getattr(cfg, 'GLOBAL_STOP', False): return None, None
             try:
-                res = requests.get(f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/generate", params=api_params, headers=headers,
-                                   proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                                   impersonate="chrome110" if cfg.ENABLE_SUB_DOMAINS else None)
+                res = requests.post(f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/create", 
+                                    json={"email": email_str}, headers=headers,
+                                    proxies=mail_proxies, verify=_ssl_verify(), timeout=15)
                 res.raise_for_status()
-                data = res.json()
-                if data and data.get("email"):
-                    email = data["email"].strip()
-                    set_last_email(email)
-                    print(f"[{cfg.ts()}] [INFO] 成功通过 Freemail 生成临时邮箱: {email}")
-                    return email, ""
-                time.sleep(1)
+                
+                set_last_email(email_str)
+                print(f"[{cfg.ts()}] [INFO] 成功通过 Freemail 指定创建邮箱: {email_str}")
+                return email_str, ""
             except Exception as e:
-                print(f"[{cfg.ts()}] [ERROR] Freemail 邮箱注册异常: {e}")
-                if "401" in str(e) or "403" in str(e): _FREEMAIL_COOKIE_CACHE.clear()
+                print(f"[{cfg.ts()}] [ERROR] Freemail 邮箱创建异常: {e}")
                 time.sleep(2)
         return None, None
 
@@ -558,18 +504,13 @@ def get_oai_code(
                     print(".", end="", flush=True)
 
             elif mode == "freemail":
-                headers = {"Content-Type": "application/json"}
-                if cfg.ENABLE_SUB_DOMAINS:
-                    _free = getattr(cfg, '_c', {}).get("freemail", {})
-                    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    cookie = _get_fm_cookie(cfg.FREEMAIL_API_URL, _free.get("admin_username", "admin"), _free.get("admin_password", ""), mail_proxies)
-                    if cookie: headers["Cookie"] = cookie
-                elif cfg.FREEMAIL_API_TOKEN:
-                    headers["Authorization"] = f"Bearer {cfg.FREEMAIL_API_TOKEN}"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {cfg.FREEMAIL_API_TOKEN}"
+                }
 
                 res = requests.get(f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/emails", params={"mailbox": email, "limit": 20},
-                                   headers=headers, proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
-                                   impersonate="chrome110" if cfg.ENABLE_SUB_DOMAINS else None)
+                                   headers=headers, proxies=mail_proxies, verify=_ssl_verify(), timeout=15)
                 if res.status_code == 200:
                     raw_data = res.json()
                     emails_list = (
