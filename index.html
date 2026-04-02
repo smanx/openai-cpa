@@ -312,7 +312,7 @@
 												<input type="checkbox" @change="toggleAllCfRoutes" :checked="cfRoutes && selectedCfRoutes && selectedCfRoutes.length === cfRoutes.length && cfRoutes.length > 0" class="form-checkbox w-4 h-4 text-blue-600 rounded">
 											</th>
 											<th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-16">#</th>
-											<th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">在线二级域名 (Email Routing)</th>
+											<th class="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">在线多级域名 (Email Routing)</th>
 											<th class="px-6 py-4 text-center text-xs font-bold text-gray-500 uppercase tracking-wider w-32">操作</th>
 										</tr>
 									</thead>
@@ -354,53 +354,87 @@
 									<option value="luckmail">luckmail (LuckMail 接码)</option>
                                 </select>
 
-                                <label class="form-label mt-4">发信域名池 (mail_domains)</label>
-                                <span class="form-hint">支持逗号分隔多域名随机轮换</span>
+                                <label class="form-label mt-4">发信域名池 (mail_domains)-这里填的域名一定要跟你cloudflare里面一样的</label>
+                                <span class="form-hint">支持逗号分隔多域名随机轮换，比如cf里是main.com，这里就填main.com</span>
                                 <input type="text" v-model="config.mail_domains" class="form-input" placeholder="如 a.com,b.com">
+
+								<div class="mt-6 p-4 bg-gray-50 rounded-xl border border-gray-200 shadow-sm">
+									<h4 class="text-sm font-bold text-gray-700 mb-3 flex items-center gap-2">
+										<span>☁️</span> Cloudflare 身份鉴权 (全局)
+									</h4>
+									<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+										<div>
+											<label class="block text-xs font-bold text-gray-600 mb-1">CF 登录账号</label>
+											<input type="text" v-model="config.cf_api_email" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500" placeholder="填写邮箱">
+										</div>
+										<div>
+											<label class="block text-xs font-bold text-gray-600 mb-1">Global API Key</label>
+											<div class="relative">
+												<input :type="showPwd.cf_key ? 'text' : 'password'" v-model="config.cf_api_key" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500 pr-10" placeholder="您的 Global API Key">
+												<button @click="showPwd.cf_key = !showPwd.cf_key" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
+													{{ showPwd.cf_key ? '👁️' : '🙈' }}
+												</button>
+											</div>
+										</div>
+									</div>
+									<p class="text-[11px] text-gray-500 mt-2">
+										获取提示：登录 Cloudflare 后，访问 <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" class="text-blue-500 hover:underline">https://dash.cloudflare.com/profile/api-tokens</a> 获取 Global API Key。
+									</p>
+								</div>
 
 								<div class="mt-5 p-5 bg-blue-50/50 rounded-xl border border-blue-200 shadow-sm flex flex-col gap-4">
 									<div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
 										<div>
-											<h4 class="text-sm font-bold text-blue-800">二级域名泛解析模式</h4>
-											<p class="text-xs text-gray-500 mt-1">登录cloudflare后，Global API Key访问这个链接拿：https://dash.cloudflare.com/profile/api-tokens</p>
-											<p class="text-xs text-gray-500 mt-1">开启后将忽略上方主域名池，使用下方生成的二级域名轮询。配置需点击右下角保存生效。</p>
-											<p v-if="!['freemail', 'imap', 'cloudflare_temp_email'].includes(config.email_api_mode)" class="text-[11px] font-bold text-red-600 mt-2 bg-red-50 px-2.5 py-1.5 rounded-md inline-block border border-red-100 shadow-sm">
-												⚠️ 系统提示：当前发信 API 模式不支持此功能！仅允许在 freemail 或 imap 模式下开启。
+											<h4 class="text-sm font-bold text-blue-800">多级域名泛解析模式</h4>
+											<p class="text-xs text-gray-500 mt-1">开启后将忽略上方主域名池，使用下方生成的子域名轮询。配置需点击右下角保存生效。</p>
+											<p v-if="!['freemail', 'imap', 'cloudflare_temp_email', 'cloudmail'].includes(config.email_api_mode)" class="text-[11px] font-bold text-red-600 mt-2 bg-red-50 px-2.5 py-1.5 rounded-md inline-block border border-red-100 shadow-sm">
+												⚠️ 系统提示：当前发信 API 模式不支持此功能！仅允许在 freemail, imap, cloudmail 等模式下开启。
 											</p>
 										</div>
-										<label class="relative inline-flex items-center shrink-0" :class="['freemail', 'imap', 'cloudflare_temp_email'].includes(config.email_api_mode) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50 grayscale'">
-											<input type="checkbox" v-model="config.enable_sub_domains" :disabled="!['freemail', 'imap', 'cloudflare_temp_email'].includes(config.email_api_mode)" class="sr-only peer">
-											<div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" :class="!['freemail', 'imap', 'cloudflare_temp_email'].includes(config.email_api_mode) ? 'peer-checked:bg-gray-400' : 'peer-checked:bg-blue-600'"></div>
+										<label class="relative inline-flex items-center shrink-0" :class="['freemail', 'imap', 'cloudflare_temp_email', 'cloudmail'].includes(config.email_api_mode) ? 'cursor-pointer' : 'cursor-not-allowed opacity-50 grayscale'">
+											<input type="checkbox" v-model="config.enable_sub_domains" :disabled="!['freemail', 'imap', 'cloudflare_temp_email', 'cloudmail'].includes(config.email_api_mode)" class="sr-only peer">
+											<div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all" :class="!['freemail', 'imap', 'cloudflare_temp_email', 'cloudmail'].includes(config.email_api_mode) ? 'peer-checked:bg-gray-400' : 'peer-checked:bg-blue-600'"></div>
 										</label>
 									</div>
 
 									<div v-if="config.enable_sub_domains" class="border-t border-blue-100 pt-4 space-y-4">
-										<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+										<div class="grid grid-cols-2 md:grid-cols-4 gap-4">
 											<div>
-												<label class="block text-xs font-bold text-gray-600 mb-1">cloudflare登录账号</label>
-												<input type="text" v-model="config.cf_api_email" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500" placeholder="邮箱">
+												<label class="block text-xs font-bold text-gray-600 mb-1">每主域生成数</label>
+												<input type="number" v-model.number="config.sub_domain_count" class="form-input bg-white mb-0 text-blue-600 font-bold border-gray-300 focus:ring-blue-500 text-center">
 											</div>
+											
 											<div>
-												<label class="block text-xs font-bold text-gray-600 mb-1">cloudflare Global API Key</label>
-												<input type="password" v-model="config.cf_api_key" class="form-input bg-white mb-0 border-gray-300 text-gray-700 focus:ring-blue-500" placeholder="是CF API 密钥Global API Key，不要填成了API令牌">
+												<label class="block text-xs font-bold text-indigo-600 mb-1">自定义域名层级</label>
+												<div class="relative">
+													<select v-model.number="config.sub_domain_level" class="form-input bg-indigo-50 mb-0 font-bold text-indigo-700 border-indigo-200 focus:ring-indigo-500 appearance-none py-2 px-3">
+														<option :value="1">2级 (prefix.main.com)</option>
+														<option :value="2">3级 (r.prefix.main.com)</option>
+														<option :value="3">4级 (r.r.prefix.main.com)</option>
+														<option :value="4">5级 (r.r.r.prefix.main.com)</option>
+														<option :value="5">6级 (r.r.r.r.prefix.main.com)</option>
+														<option :value="6">7级 (r.r.r.r.r.prefix.main.com)</option>
+													</select>
+													<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-indigo-500">
+														<span class="text-[10px]">▼</span>
+													</div>
+												</div>
 											</div>
+
 											<div>
-												<label class="block text-xs font-bold text-gray-600 mb-1">每个主域生成数量</label>
-												<input type="number" v-model.number="config.sub_domain_count" class="form-input bg-white mb-0 text-blue-600 font-bold border-gray-300 focus:ring-blue-500" placeholder="10">
+												<label class="block text-xs font-bold text-red-600 mb-1">失败几次执行自愈</label>
+												<input type="number" v-model.number="config.sub_domain_fail_threshold" class="form-input bg-white mb-0 text-red-600 font-bold border-red-200 focus:ring-red-500 text-center" placeholder="3">
 											</div>
-											<div>
-												<label class="block text-xs font-bold text-red-600 mb-1">域名失败几次执行自愈</label>
-												<input type="number" v-model.number="config.sub_domain_fail_threshold" class="form-input bg-white mb-0 text-red-600 font-bold border-red-200 focus:ring-red-500" placeholder="默认: 3">
-											</div>
+
 											<div>
 												<label class="block text-xs font-bold text-green-600 mb-1">单次更替补货数量</label>
-												<input type="number" v-model.number="config.sub_domain_refill_count" class="form-input bg-white mb-0 text-green-600 font-bold border-green-200 focus:ring-green-500" placeholder="默认: 1">
+												<input type="number" v-model.number="config.sub_domain_refill_count" class="form-input bg-white mb-0 text-green-600 font-bold border-green-200 focus:ring-green-500 text-center" placeholder="1">
 											</div>
 										</div>
 
 										<div class="flex flex-wrap gap-3">
 											<button @click="executeGenerateDomainsOnly" class="px-5 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg shadow-md hover:bg-blue-700 transition flex items-center gap-2">
-												<span>🔄</span> 随机生成二级域名
+												<span>🎲</span> 随机生成域名
 											</button>
 											<button @click="executeSyncToCF" 
 													class="px-5 py-2.5 bg-teal-600 text-white text-sm font-bold rounded-lg shadow-md hover:bg-teal-700 transition flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed" 
@@ -413,7 +447,7 @@
 										<div v-if="config.sub_domains_list" class="mt-2 p-4 bg-white rounded-xl border border-gray-200">
 											<h4 class="text-xs font-bold text-gray-500 mb-3 flex items-center gap-2">
 												<span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-												已生成 / 即将生效的二级域名池 ({{ config.sub_domains_list.split(',').length }} 个)
+												已生成 / 即将生效的域名池 ({{ config.sub_domains_list.split(',').length }} 个)
 											</h4>
 											<div class="flex flex-wrap gap-2">
 												<div v-for="domain in config.sub_domains_list.split(',').filter(d=>d)" :key="domain" 
@@ -425,7 +459,6 @@
 										</div>
 									</div>
 								</div>
-								
                                 <label class="form-checkbox-label mt-5 p-3 bg-gray-50 rounded-lg border border-gray-100">
                                     <input type="checkbox" v-model="config.use_proxy_for_email" class="form-checkbox mt-1 text-blue-600">
                                     <div>
@@ -458,8 +491,8 @@
                                         </button>
                                     </div>
 									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/dreamhunter2333/cloudflare_temp_email</p>
-									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">如果开启了左边的【二级域名泛解析开关】必需要部署魔改项目否则项目无法启动</p>
-									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">魔改项目：https://github.com/wenfxl/cloudflare_temp_email_worker</p>
+									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">如果开启了左边的【多级域名泛解析开关】必需要部署魔改项目否则项目无法启动</p>
+									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">指定配套魔改项目：https://github.com/wenfxl/cloudflare_temp_email_worker</p>
 								</div>
                                 
                                 <div v-if="config.email_api_mode === 'imap' && config.imap">
@@ -492,28 +525,7 @@
 											{{ showPwd.free_token ? '👁️' : '🙈' }}
 										</button>
 									</div>
-
-									<div class="grid grid-cols-2 gap-4 mt-5 p-4 bg-gray-50 rounded-lg border border-gray-200">
-										<div class="col-span-2">
-											<p class="text-xs font-bold text-gray-500 mb-0">⬇️ 管理员配置 (仅用于往 CF 推送时自动同步二级域名)</p>
-										</div>
-										<div>
-											<label class="form-label">管理员账号</label>
-											<input type="text" v-model="config.freemail.admin_username" class="form-input bg-white" placeholder="默认: admin">
-										</div>
-										<div>
-											<label class="form-label">管理员密码</label>
-											<div class="relative mb-2">
-												<input :type="showPwd.free_pass ? 'text' : 'password'" v-model="config.freemail.admin_password" class="form-input bg-white pr-10" style="margin-bottom: 0;">
-												<button @click="showPwd.free_pass = !showPwd.free_pass" class="absolute right-3 top-1/2 -translate-y-1/2 text-lg text-gray-400 hover:text-blue-500 focus:outline-none">
-													{{ showPwd.free_pass ? '👁️' : '🙈' }}
-												</button>
-											</div>
-										</div>
-									</div>
-									<p class="text-sm text-yellow-700 mt-4 mb-0 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/smanx/freemail</p>
-									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">如果开启了左边的【二级域名泛解析开关】必需要部署魔改项目否则项目无法启动</p>
-									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">魔改项目：https://github.com/Msg-Lbo/mailfree</p>
+									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">指定配套项目地址：https://github.com/wenfxl/freemail</p>
 								</div>
 
                                 <div v-if="config.email_api_mode === 'cloudmail' && config.cloudmail">
@@ -530,6 +542,9 @@
                                         </button>
                                     </div>
 									<p class="text-sm text-yellow-700 mb-4 font-bold bg-yellow-100 inline-block px-2 py-1 rounded">项目地址：https://github.com/maillab/cloud-mail</p>
+									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">如果开启了左边的【多级域名泛解析开关】必需要部署魔改项目否则项目无法启动</p>
+									<p class="text-sm text-red-700 mt-4 mb-0 font-bold bg-red-100 inline-block px-2 py-1 rounded">指定配套魔改项目：https://github.com/wenfxl/cloud-mail</p>
+									
                                 </div>
 
                                 <div v-if="config.email_api_mode === 'mail_curl' && config.mail_curl">
