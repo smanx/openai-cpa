@@ -155,14 +155,39 @@ def get_email_and_token(proxies: Any = None) -> tuple:
         selected_domain = random.choice(domain_list)
         domain_index = domain_list.index(selected_domain)
         print(f"[{cfg.ts()}] [INFO] Freemail 选择域名: {selected_domain} (索引: {domain_index}/{len(domain_list)})")
+        
+        # 先获取服务端可用的域名列表，用于调试
+        try:
+            domains_res = requests.get(
+                f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/domains",
+                headers=headers,
+                proxies=mail_proxies,
+                verify=_ssl_verify(),
+                timeout=10,
+                impersonate="chrome",
+            )
+            if domains_res.status_code == 200:
+                server_domains = domains_res.json()
+                print(f"[{cfg.ts()}] [DEBUG] Freemail 服务端可用域名: {server_domains}")
+        except Exception as e:
+            print(f"[{cfg.ts()}] [DEBUG] 获取服务端域名列表失败: {e}")
 
         for attempt in range(5):
             if getattr(cfg, 'GLOBAL_STOP', False): return None, None
             try:
+                # 尝试两种方式：先尝试 domain 参数，再尝试 domainIndex
+                payload = {"local": prefix}
+                if attempt < 3:
+                    payload["domain"] = selected_domain
+                    print(f"[{cfg.ts()}] [DEBUG] 尝试使用 domain 参数: {selected_domain}")
+                else:
+                    payload["domainIndex"] = domain_index
+                    print(f"[{cfg.ts()}] [DEBUG] 尝试使用 domainIndex 参数: {domain_index}")
+                
                 res = requests.post(
                     f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/create",
                     headers=headers,
-                    json={"local": prefix, "domainIndex": domain_index},
+                    json=payload,
                     proxies=mail_proxies,
                     verify=_ssl_verify(),
                     timeout=15,
