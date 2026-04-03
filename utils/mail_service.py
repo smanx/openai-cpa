@@ -222,11 +222,18 @@ def get_email_and_token(proxies: Any = None) -> tuple:
 
         return None, None
 
-    domain_list = [d.strip() for d in cfg.MAIL_DOMAINS.split(",") if d.strip()]
+    # 优先使用子域名列表
+    if cfg.ENABLE_SUB_DOMAINS and cfg.SUB_DOMAINS_LIST:
+        domain_list = [d.strip() for d in cfg.SUB_DOMAINS_LIST.split(",") if d.strip()]
+    else:
+        domain_list = [d.strip() for d in cfg.MAIL_DOMAINS.split(",") if d.strip()]
+    
     if not domain_list:
         print(f"[{cfg.ts()}] [ERROR] MAIL_DOMAINS 配置为空，无法生成邮箱！")
         return None, None
+    
     selected_domain = random.choice(domain_list)
+    print(f"[{cfg.ts()}] [INFO] {mode} 选择域名: {selected_domain}")
     email_str = f"{prefix}@{selected_domain}"
 
     if mode == "imap":
@@ -250,6 +257,9 @@ def get_email_and_token(proxies: Any = None) -> tuple:
 
     headers = {"x-admin-auth": cfg.ADMIN_AUTH, "Content-Type": "application/json"}
     body = {"enablePrefix": False, "name": prefix, "domain": selected_domain}
+    print(f"[{cfg.ts()}] [DEBUG] {mode} 调用 API: {cfg.GPTMAIL_BASE}/admin/new_address")
+    print(f"[{cfg.ts()}] [DEBUG] 请求体: {body}")
+    
     for attempt in range(5):
         if getattr(cfg, 'GLOBAL_STOP', False): return None, None
         try:
@@ -258,8 +268,19 @@ def get_email_and_token(proxies: Any = None) -> tuple:
                 headers=headers, json=body,
                 proxies=mail_proxies, verify=_ssl_verify(), timeout=15,
             )
+            print(f"[{cfg.ts()}] [DEBUG] API 返回状态码: {res.status_code}")
+            print(f"[{cfg.ts()}] [DEBUG] API 返回内容: {res.text[:500]}")
+            
             res.raise_for_status()
-            data = res.json()
+            
+            try:
+                data = res.json()
+            except Exception as json_err:
+                print(f"[{cfg.ts()}] [ERROR] JSON 解析失败: {json_err}")
+                print(f"[{cfg.ts()}] [ERROR] 原始响应: {res.text}")
+                time.sleep(2)
+                continue
+            
             if data and data.get("address"):
                 email = data["address"].strip()
                 jwt = data.get("jwt", "").strip()
@@ -270,6 +291,8 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             time.sleep(1)
         except Exception as e:
             print(f"[{cfg.ts()}] [ERROR] 邮箱注册网络异常，准备重试: {e}")
+            import traceback
+            print(f"[{cfg.ts()}] [DEBUG] 详细错误: {traceback.format_exc()}")
             time.sleep(2)
     return None, None
 
