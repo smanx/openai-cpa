@@ -26,18 +26,67 @@ from utils.config import reload_all_configs
 from utils import db_manager
 from utils.sub2api_client import Sub2APIClient
 
+ENGINE_STATE_FILE = "data/engine.state"
+
+def get_saved_engine_mode():
+    try:
+        if os.path.exists(ENGINE_STATE_FILE):
+            with open(ENGINE_STATE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("mode"), data.get("proxy")
+    except:
+        pass
+    return None, None
+
+def save_engine_mode(mode, proxy=None):
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(ENGINE_STATE_FILE, "w") as f:
+            json.dump({"mode": mode, "proxy": proxy}, f)
+    except:
+        pass
+
+def clear_engine_mode():
+    try:
+        if os.path.exists(ENGINE_STATE_FILE):
+            os.remove(ENGINE_STATE_FILE)
+    except:
+        pass
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        saved_mode, saved_proxy = get_saved_engine_mode()
+        if saved_mode and not engine.is_running():
+            try: reload_all_configs()
+            except Exception as e: print(f"[{core_engine.ts()}] [警告] 自动启动重载配置: {e}")
+            args = DummyArgs(proxy=saved_proxy)
+            core_engine.run_stats["success"] = 0
+            core_engine.run_stats["failed"] = 0
+            core_engine.run_stats["retries"] = 0
+            core_engine.run_stats["start_time"] = time.time()
+            if saved_mode == "cpa":
+                core_engine.run_stats["target"] = 0
+                engine.start_cpa(args)
+                print(f"[{core_engine.ts()}] [系统] 已自动恢复 [CPA 智能仓管模式]", flush=True)
+            elif saved_mode == "sub2api":
+                engine.start_sub2api(args)
+                print(f"[{core_engine.ts()}] [系统] 已自动恢复 [Sub2API 仓管模式]", flush=True)
+            elif saved_mode == "normal":
+                core_engine.run_stats["target"] = core_engine.cfg.NORMAL_TARGET_COUNT
+                engine.start_normal(args)
+                print(f"[{core_engine.ts()}] [系统] 已自动恢复 [常规量产模式]", flush=True)
+    except Exception as e:
+        print(f"[{core_engine.ts()}] [警告] 自动恢复引擎失败: {e}")
+
     yield
     print("\n" + "="*65, flush=True)
     print("🛑 接收到系统终止信号，正在强制结束引擎...", flush=True)
-    
     try:
         if engine.is_running():
             engine.stop()
     except Exception:
         pass
-        
     print("💥 已强制斩断所有底层连接，进程秒退！", flush=True)
     print("="*65 + "\n", flush=True)
     os._exit(0)
@@ -159,13 +208,16 @@ async def start_task(token: str = Depends(verify_token)):
     if getattr(core_engine.cfg, 'ENABLE_CPA_MODE', False):
         core_engine.run_stats["target"] = 0
         engine.start_cpa(args)
+        save_engine_mode("cpa", default_proxy)
         return {"status": "success", "message": "启动成功：已自动识别并开启 [CPA 智能仓管模式]"}
     elif getattr(core_engine.cfg, 'ENABLE_SUB2API_MODE', False):
         engine.start_sub2api(args)
+        save_engine_mode("sub2api", default_proxy)
         return {"status": "success", "message": "启动成功：已自动识别并开启 [Sub2API 仓管模式]"}
     else:
         core_engine.run_stats["target"] = core_engine.cfg.NORMAL_TARGET_COUNT
         engine.start_normal(args)
+        save_engine_mode("normal", default_proxy)
         return {"status": "success", "message": "启动成功：已自动识别并开启 [常规量产模式]"}
 
 @app.post("/api/accounts/export_selected")
@@ -239,6 +291,7 @@ async def stop_task(token: str = Depends(verify_token)):
     if not engine.is_running():
         return {"status": "warning", "message": "当前没有运行的任务"}
     engine.stop()
+    clear_engine_mode()
     return {"status": "success", "message": "已发送停止指令，正在安全退出..."}
 
 @app.get("/api/config")
