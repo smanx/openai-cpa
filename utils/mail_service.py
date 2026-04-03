@@ -141,19 +141,20 @@ def get_email_and_token(proxies: Any = None) -> tuple:
             "Content-Type": "application/json",
             "X-Admin-Token": cfg.FREEMAIL_API_TOKEN
         }
-        pool = getattr(cfg, 'SUB_DOMAINS_LIST', '') if cfg.ENABLE_SUB_DOMAINS else cfg.MAIL_DOMAINS
-        domain_list = [d.strip() for d in pool.split(",") if d.strip()]
+        # 优先使用子域名列表
+        if cfg.ENABLE_SUB_DOMAINS and cfg.SUB_DOMAINS_LIST:
+            domain_list = [d.strip() for d in cfg.SUB_DOMAINS_LIST.split(",") if d.strip()]
+        else:
+            domain_list = [d.strip() for d in cfg.MAIL_DOMAINS.split(",") if d.strip()]
 
         if not domain_list:
             print(f"[{cfg.ts()}] [ERROR] Freemail 域名池为空！请检查配置。")
             return None, None
 
+        # 直接使用我们的域名列表索引，确保使用正确的子域名
         selected_domain = random.choice(domain_list)
-        domain_index = 0
-        if cfg.ENABLE_SUB_DOMAINS and cfg.SUB_DOMAINS_LIST:
-            sub_domains = [d.strip() for d in cfg.SUB_DOMAINS_LIST.split(",") if d.strip()]
-            if selected_domain in sub_domains:
-                domain_index = sub_domains.index(selected_domain)
+        domain_index = domain_list.index(selected_domain)
+        print(f"[{cfg.ts()}] [INFO] Freemail 选择域名: {selected_domain} (索引: {domain_index}/{len(domain_list)})")
 
         for attempt in range(5):
             if getattr(cfg, 'GLOBAL_STOP', False): return None, None
