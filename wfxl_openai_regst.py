@@ -617,4 +617,4 @@ if __name__ == "__main__":
     sys.__stdout__.write(f"[{core_engine.ts()}] [系统] 控制台初始密码：admin \n")
     sys.__stdout__.write(f"[{core_engine.ts()}] [系统] 结束请猛猛重复按CTRL+C \n")
     sys.__stdout__.flush()
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning", access_log=False, timeout_graceful_shutdown=1)
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="warning", access_log=False, timeout_graceful_shutdown=1)

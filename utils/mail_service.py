@@ -137,33 +137,63 @@ def get_email_and_token(proxies: Any = None) -> tuple:
 
     if mode == "freemail":
         headers = {
+            "Accept": "application/json",
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {cfg.FREEMAIL_API_TOKEN}"
+            "X-Admin-Token": cfg.FREEMAIL_API_TOKEN
         }
         pool = getattr(cfg, 'SUB_DOMAINS_LIST', '') if cfg.ENABLE_SUB_DOMAINS else cfg.MAIL_DOMAINS
         domain_list = [d.strip() for d in pool.split(",") if d.strip()]
-        
+
         if not domain_list:
             print(f"[{cfg.ts()}] [ERROR] Freemail 域名池为空！请检查配置。")
             return None, None
-            
+
         selected_domain = random.choice(domain_list)
-        email_str = f"{prefix}@{selected_domain}"
-        
+        domain_index = 0
+        if cfg.ENABLE_SUB_DOMAINS and cfg.SUB_DOMAINS_LIST:
+            sub_domains = [d.strip() for d in cfg.SUB_DOMAINS_LIST.split(",") if d.strip()]
+            if selected_domain in sub_domains:
+                domain_index = sub_domains.index(selected_domain)
+
         for attempt in range(5):
             if getattr(cfg, 'GLOBAL_STOP', False): return None, None
             try:
-                res = requests.post(f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/create", 
-                                    json={"email": email_str}, headers=headers,
-                                    proxies=mail_proxies, verify=_ssl_verify(), timeout=15)
-                res.raise_for_status()
-                
-                set_last_email(email_str)
-                print(f"[{cfg.ts()}] [INFO] 成功通过 Freemail 指定创建邮箱: {email_str}")
-                return email_str, ""
+                res = requests.post(
+                    f"{cfg.FREEMAIL_API_URL.rstrip('/')}/api/create",
+                    headers=headers,
+                    json={"local": prefix, "domainIndex": domain_index},
+                    proxies=mail_proxies,
+                    verify=_ssl_verify(),
+                    timeout=15,
+                    impersonate="chrome",
+                )
+
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, dict):
+                        email = data.get("address") or data.get("email")
+                        if email:
+                            set_last_email(email)
+                            print(f"[{cfg.ts()}] [INFO] Freemail 成功创建邮箱: {email}")
+                            return email, ""
+                    email = data.get("email") if isinstance(data, list) else None
+                    if email:
+                        set_last_email(email)
+                        print(f"[{cfg.ts()}] [INFO] Freemail 成功创建邮箱: {email}")
+                        return email, ""
+
+                error_msg = f"HTTP {res.status_code}: {res.text[:200]}"
+                print(f"[{cfg.ts()}] [ERROR] Freemail 邮箱创建失败 ({attempt+1}/5): {error_msg}")
+
+                if res.status_code >= 400 and res.status_code < 500:
+                    print(f"[{cfg.ts()}] [ERROR] Freemail 客户端错误，不再重试")
+                    break
+
             except Exception as e:
                 print(f"[{cfg.ts()}] [ERROR] Freemail 邮箱创建异常: {e}")
-                time.sleep(2)
+
+            time.sleep(2)
+
         return None, None
 
     domain_list = [d.strip() for d in cfg.MAIL_DOMAINS.split(",") if d.strip()]
